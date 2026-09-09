@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,6 +57,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "doubao-seed-2.0-lite")
 
 CHUNK_TARGET = 700
 CHUNK_MAX = 1000
+DEFAULT_MAX_WORKERS = 4
 
 
 ARTICLE_SUMMARY_PROMPT = """你是一位专业分析师，同时为知识图谱构建系统生成可解析数据。
@@ -488,6 +490,7 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
 
 def main() -> int:
     ensure_directories()
+    load_env_file()
     pending_files = pending_markdown_files()
 
     if not pending_files:
@@ -499,33 +502,47 @@ def main() -> int:
     seen_article_ids = load_existing_ids(OUT_ARTICLES)
     seen_chunk_ids = load_existing_ids(OUT_CHUNKS)
 
-    failed_files: list[str] = []
-    for md_path in pending_files:
-        print(f"\n开始处理: {md_path.name}")
-        try:
-            article_row, chunk_rows = generate_article_rows(md_path)
-            written_articles = append_unique_rows(
-                OUT_ARTICLES,
-                ARTICLE_FIELDS,
-                [article_row],
-                seen_article_ids,
-            )
-            written_chunks = append_unique_rows(
-                OUT_CHUNKS,
-                CHUNK_FIELDS,
-                chunk_rows,
-                seen_chunk_ids,
-            )
-            print(
-                f"新增文章 {len(written_articles)} 行, "
-                f"新增切片 {len(written_chunks)} 行"
-            )
+    max_workers = max(
+        1,
+        int(os.getenv("SUMMARIZE_PIPELINE_WORKERS", str(DEFAULT_MAX_WORKERS))),
+    )
+    print(f"使用 {max_workers} 个线程处理 {len(pending_files)} 个文件")
 
-            moved_path = move_to_done(md_path)
-            print(f"已归档: {moved_path.relative_to(BASE_DIR)}")
-        except Exception as exc:
-            failed_files.append(md_path.name)
-            print(f"处理失败: {md_path.name}: {exc}")
+    failed_files: list[str] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {
+            executor.submit(generate_article_rows, md_path): md_path
+            for md_path in pending_files
+        }
+
+        for future in as_completed(future_to_path):
+            md_path = future_to_path[future]
+            try:
+                article_row, chunk_rows = future.result()
+                written_articles = append_unique_rows(
+                    OUT_ARTICLES,
+                    ARTICLE_FIELDS,
+                    [article_row],
+                    seen_article_ids,
+                )
+                written_chunks = append_unique_rows(
+                    OUT_CHUNKS,
+                    CHUNK_FIELDS,
+                    chunk_rows,
+                    seen_chunk_ids,
+                )
+                print(
+                    f"\n处理完成: {md_path.name}, "
+                    f"新增文章 {len(written_articles)} 行, "
+                    f"新增切片 {len(written_chunks)} 行"
+                )
+
+                moved_path = move_to_done(md_path)
+                print(f"已归档: {moved_path.relative_to(BASE_DIR)}")
+            except Exception as exc:
+                failed_files.append(md_path.name)
+                print(f"处理失败: {md_path.name}: {exc}")
+
 
     if failed_files:
         print("\n以下文件处理失败，保留在 undo:")
