@@ -58,6 +58,28 @@ MODEL_NAME = os.getenv("MODEL_NAME", "doubao-seed-2.0-lite")
 CHUNK_TARGET = 700
 CHUNK_MAX = 1000
 DEFAULT_MAX_WORKERS = 4
+DEFAULT_JSON_RETRIES = int(os.getenv("SUMMARIZE_JSON_RETRIES", "2"))
+MAX_OUTPUT_TOKENS = int(os.getenv("SUMMARIZE_MAX_OUTPUT_TOKENS", "8192"))
+
+ALLOWED_RELATIONS = [
+    "导致",
+    "影响",
+    "促进",
+    "抑制",
+    "先于",
+    "服务",
+    "依赖",
+    "配合",
+    "削弱",
+    "替代",
+    "构成",
+    "属于",
+    "决定",
+    "交易",
+    "持有",
+    "参与",
+    "管辖",
+]
 
 
 ARTICLE_SUMMARY_PROMPT = """你是一位专业分析师，同时为知识图谱构建系统生成可解析数据。
@@ -73,17 +95,22 @@ ARTICLE_SUMMARY_PROMPT = """你是一位专业分析师，同时为知识图谱�
 实体要求：
 - 提取 8-15 个重要实体。
 - 每个实体字段：name（原始名称）、type（国家/机构/政策工具/事件/概念/资产/人物/制度等）、aliases（可能有多个别名，至少 1 个）、evidence（原文短语或短句）。
+- evidence 必须是原文中最短且足以证明该实体的片段，最多 50 个字；不要整段复制，不要扩写。
 - 同名实体只出现一次，不同写法放进 aliases。
 
 关系要求：
 - 提取 8-15 条实体关系。
 - 每个关系字段：source、target、relation、evidence。
+- evidence 必须是原文中最短且足以证明该关系的片段，最多 50 个字；不要整句复制，不要解释关系内容。
 - source 和 target 必须出现在 entities 的 name 或 aliases 中。
-- relation 只能从以下集合选择：导致、服务、依赖、配合、削弱、构成、属于、决定。
+- relation 只能从以下集合选择：<<RELATIONS>>。
+- 优先选择最贴切的关系，不要把所有因果关系都归类为“导致”。
 
 输出要求：
 - 只输出一个合法 JSON 对象，不要 Markdown 代码块，不要额外解释。
 - JSON 顶层字段必须为：human_summary、core_theme、key_points、entities、relationships。
+- 文字表达要简洁，不要重复同一信息，不要展开背景说明。
+- 整个 JSON 总长度控制在 2000 个汉字以内；如果接近上限，优先减少实体/关系数量或缩短 evidence。
 - key_points 为 3-5 条字符串。
 - entities 和 relationships 必须是数组。
 - 如果原文较短导致数量不足，可以低于下限，但 human_summary 中需说明信息有限。
@@ -122,12 +149,16 @@ CHUNK_SUMMARY_PROMPT = """你是一位专业文本分析师，为一个长文章
 实体和关系要求：
 - 提取 3-8 个本切片关键实体，字段为 name、type、aliases、evidence。
 - 提取 2-6 条本切片关键关系，字段为 source、target、relation、evidence。
+- evidence 必须是原文中最短且足以证明该实体或关系的片段，最多 50 个字；不要整段复制，不要扩写。
 - source 和 target 必须出现在 entities 的 name 或 aliases 中。
-- relation 只能从以下集合选择：导致、服务、依赖、配合、削弱、构成、属于、决定。
+- relation 只能从以下集合选择：<<RELATIONS>>。
+- 优先选择最贴切的关系，不要把所有因果关系都归类为“导致”。
 
 输出要求：
 - 只输出一个合法 JSON 对象，不要 Markdown 代码块，不要额外解释。
 - JSON 顶层字段必须为：human_summary、core_argument、entities、relationships、context_to_next、boundary_incomplete。
+- 文字表达要简洁，不要重复同一信息，不要展开背景说明。
+- 整个 JSON 总长度控制在 1000 个汉字以内；如果接近上限，优先减少实体/关系数量或缩短 evidence。
 - context_to_next 用一句话说明本切片与下一个切片的衔接线索，如果后面切片为空则写空字符串。
 - boundary_incomplete 为布尔值，表示本切片开头或结尾是否被截断。
 
@@ -313,6 +344,10 @@ def chunk_article(text: str, target: int = CHUNK_TARGET, max_len: int = CHUNK_MA
     return chunks
 
 
+class LLMTruncatedError(RuntimeError):
+    """Raised when the model response explicitly reports finish_reason=length."""
+
+
 def call_llm(
     prompt: str,
     max_tokens: int,
@@ -346,7 +381,15 @@ def call_llm(
     )
     response.raise_for_status()
     data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
+    choice = data["choices"][0]
+    content = (choice.get("message") or {}).get("content", "").strip()
+    if choice.get("finish_reason") == "length":
+        raise LLMTruncatedError(
+            f"LLM 输出因 max_tokens={max_tokens} 被截断，请加大输出长度或重试"
+        )
+    if not content:
+        raise ValueError("LLM 返回了空内容")
+    return content
 
 
 def parse_json_response(content: str) -> dict:
@@ -396,6 +439,77 @@ def parse_json_response(content: str) -> dict:
     return data
 
 
+def validate_graph_relations(data: dict) -> dict:
+    relationships = data.get("relationships") or []
+    if not isinstance(relationships, list):
+        raise ValueError("relationships 必须是数组")
+
+    for relationship in relationships:
+        if not isinstance(relationship, dict):
+            raise ValueError("relationship 必须是对象")
+        relation = relationship.get("relation")
+        if relation not in ALLOWED_RELATIONS:
+            raise ValueError(
+                f"LLM 返回了未定义的关系类型: {relation!r}; "
+                f"允许的关系为: {'、'.join(ALLOWED_RELATIONS)}"
+            )
+    return data
+
+
+def call_llm_json(
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+    max_retries: int = DEFAULT_JSON_RETRIES,
+    fallback_prompt: str | None = None,
+) -> dict:
+    """Call the model, parse JSON, and retry once or twice when output is truncated/invalid."""
+    current_prompt = prompt
+    current_max_tokens = max_tokens
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            content = call_llm(
+                current_prompt,
+                current_max_tokens,
+                temperature,
+                json_mode=True,
+            )
+            data = parse_json_response(content)
+            return validate_graph_relations(data)
+        except (LLMTruncatedError, ValueError) as exc:
+            last_error = exc
+            if attempt >= max_retries:
+                break
+            current_prompt = (
+                prompt
+                + "\n\n注意：你上一次的输出不完整或不是合法 JSON。"
+                "请重新输出一个完整 JSON 对象，确保所有括号和引号均已闭合，"
+                "不要输出 Markdown 代码块或额外解释。"
+            )
+            current_max_tokens = min(current_max_tokens * 2, MAX_OUTPUT_TOKENS)
+
+    if fallback_prompt is not None and fallback_prompt != prompt:
+        print("JSON 完整输出仍失败，降低实体/关系数量后重试")
+        return call_llm_json(
+            fallback_prompt,
+            current_max_tokens,
+            temperature,
+            max_retries=max_retries,
+        )
+
+    raise last_error or RuntimeError("LLM JSON 输出重试失败")
+
+
+def build_prompt_with_reduced_entities(prompt: str) -> str:
+    """Return an article prompt that permits fewer entities/relationships."""
+    return (
+        prompt.replace("提取 8-15 个重要实体", "为了控制输出长度，提取 6-12 个重要实体")
+        .replace("提取 8-15 条实体关系", "为了控制输出长度，提取 6-12 条实体关系")
+    )
+
+
 def adjacent_contexts(chunks: list[str], index: int) -> tuple[str, str]:
     previous = chunks[index - 2][-120:] if index > 1 else ""
     following = chunks[index][:120] if index < len(chunks) else ""
@@ -413,15 +527,18 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
     print(f"切片数量: {len(chunks)}")
 
     article_prompt = (
-        ARTICLE_SUMMARY_PROMPT.replace("<<TITLE>>", title).replace("<<CONTENT>>", article_text)
+        ARTICLE_SUMMARY_PROMPT
+        .replace("<<RELATIONS>>", "、".join(ALLOWED_RELATIONS))
+        .replace("<<TITLE>>", title)
+        .replace("<<CONTENT>>", article_text)
     )
-    article_raw = call_llm(
+    article_data = call_llm_json(
         article_prompt,
         max_tokens=2500,
         temperature=0.3,
-        json_mode=True,
+        fallback_prompt=build_prompt_with_reduced_entities(article_prompt),
     )
-    article_data = parse_json_response(article_raw)
+    article_raw = json.dumps(article_data, ensure_ascii=False)
     article_summary = article_data.get("human_summary") or article_raw
     article_json = json.dumps(article_data, ensure_ascii=False)
 
@@ -433,6 +550,7 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
 
         chunk_prompt = (
             CHUNK_SUMMARY_PROMPT
+            .replace("<<RELATIONS>>", "、".join(ALLOWED_RELATIONS))
             .replace("<<TITLE>>", title)
             .replace("<<INDEX>>", str(index))
             .replace("<<TOTAL>>", str(len(chunks)))
@@ -440,13 +558,12 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
             .replace("<<PREVIOUS>>", previous_snippet)
             .replace("<<NEXT>>", next_snippet)
         )
-        chunk_raw = call_llm(
+        chunk_data = call_llm_json(
             chunk_prompt,
             max_tokens=1200,
             temperature=0.3,
-            json_mode=True,
         )
-        chunk_data = parse_json_response(chunk_raw)
+        chunk_raw = json.dumps(chunk_data, ensure_ascii=False)
         chunk_summaries[index] = chunk_data.get("human_summary") or chunk_raw
         chunk_json_by_index[index] = json.dumps(chunk_data, ensure_ascii=False)
 

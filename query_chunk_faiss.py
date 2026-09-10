@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Query the chunk FAISS index built by build_chunk_faiss.py.
+"""Query the chunk FAISS index and return chunk text fields.
 
 Query embedding must use the same local model, normalization, and metric as
 the index build: SentenceTransformer(...), normalize_embeddings=True,
@@ -12,7 +12,6 @@ import argparse
 import json
 import os
 import sqlite3
-import sys
 from pathlib import Path
 
 import faiss
@@ -65,32 +64,49 @@ def search(query: str, top_k: int) -> list[dict[str, object]]:
         placeholders = ",".join("?" for _ in indices[0])
         cursor = connection.execute(
             f"""
-            SELECT faiss_id, id, article_id, chunk_index
-            FROM chunk_vectors
-            WHERE faiss_id IN ({placeholders})
+            SELECT
+                c.faiss_id,
+                c.id,
+                c.article_id,
+                c.chunk_index,
+                t.content,
+                t.summary,
+                t.summary_json
+            FROM chunk_vectors c
+            JOIN chunk_texts t ON t.id = c.id
+            WHERE c.faiss_id IN ({placeholders})
             """,
             [int(faiss_id) for faiss_id in indices[0]],
         )
-        metadata_by_id = {
-            row[0]: {
+        rows_by_faiss: dict[int, dict[str, object]] = {}
+        for row in cursor.fetchall():
+            raw_summary_json = row[6]
+            try:
+                summary_json: object = json.loads(raw_summary_json)
+            except json.JSONDecodeError:
+                summary_json = raw_summary_json
+
+            rows_by_faiss[int(row[0])] = {
                 "id": row[1],
                 "article_id": row[2],
                 "chunk_index": row[3],
+                "content": row[4],
+                "summary": row[5],
+                "summary_json": summary_json,
             }
-            for row in cursor.fetchall()
-        }
     finally:
         connection.close()
 
     results: list[dict[str, object]] = []
     for faiss_id, score in zip(indices[0], distances[0]):
-        if int(faiss_id) not in metadata_by_id:
+        faiss_id = int(faiss_id)
+        if faiss_id not in rows_by_faiss:
             continue
         results.append(
             {
-                "faiss_id": int(faiss_id),
+                "faiss_id": faiss_id,
                 "score": float(score),
-                **metadata_by_id[int(faiss_id)],
+                **rows_by_faiss[faiss_id],
             }
         )
     return results
@@ -98,7 +114,7 @@ def search(query: str, top_k: int) -> list[dict[str, object]]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Query results/chunks.faiss and return SQLite-backed chunk locations."
+        description="Query results/chunks.faiss and return SQLite-backed chunk text fields."
     )
     parser.add_argument("query", help="自然语言查询，例如：美债规模")
     parser.add_argument(

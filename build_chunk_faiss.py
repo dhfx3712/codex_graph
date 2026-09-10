@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Build a FAISS index from chunks.csv summary_json.
+"""Build a FAISS index and a chunk-text store from chunks.csv.
 
 Embedding text is: summary_json.human_summary + "\n" + summary_json.core_argument.
-The index uses faiss.IndexIDMap2(IndexFlatIP(384)) and is rebuilt from scratch
-every run. Metadata is written to a SQLite file alongside the FAISS index.
+The FAISS index is rebuilt from scratch every run.
+
+Metadata and text fields are written to one SQLite file:
+- chunk_vectors: faiss_id -> id
+- chunk_texts: id -> content/summary/summary_json
+Duplicate ids are ignored. If the same id appears with different content,
+the new row is skipped and a warning is written to stderr.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -111,22 +117,49 @@ def load_summary_text(raw_summary_json: str) -> str | None:
     return "\n".join(parts)
 
 
-def read_chunk_records(max_rows: int | None) -> tuple[list[str], list[dict[str, object]], int]:
-    """Read chunks.csv and return texts, faiss-side metadata, and skipped count."""
+def make_row_hash(row: dict[str, object]) -> str:
+    payload = {
+        "id": row.get("id", ""),
+        "article_id": row.get("article_id", ""),
+        "chunk_index": row.get("chunk_index", ""),
+        "content": row.get("content", ""),
+        "summary": row.get("summary", ""),
+        "summary_json": row.get("summary_json", ""),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def read_chunk_records(
+    max_rows: int | None,
+) -> tuple[list[str], list[dict[str, object]], dict[str, int]]:
+    """Read full-history chunks.csv and return unique valid rows for embedding/store."""
 
     if not CHUNKS_CSV.is_file():
         raise FileNotFoundError(f"找不到输入文件: {CHUNKS_CSV}")
 
     texts: list[str] = []
-    metadata_rows: list[dict[str, object]] = []
-    skipped = 0
+    chunk_rows: list[dict[str, object]] = []
+    seen_hashes: dict[str, str] = {}
+    counters = {
+        "skipped": 0,
+        "duplicate_changed": 0,
+        "duplicate_identical": 0,
+    }
 
     with CHUNKS_CSV.open("r", encoding="utf-8-sig", newline="") as fp:
         reader = csv.DictReader(fp)
         if not reader.fieldnames:
             raise ValueError(f"{CHUNKS_CSV} 没有有效表头")
 
-        required_columns = {"id", "article_id", "chunk_index", "summary_json"}
+        required_columns = {
+            "id",
+            "article_id",
+            "chunk_index",
+            "content",
+            "summary",
+            "summary_json",
+        }
         missing_columns = required_columns - set(reader.fieldnames)
         if missing_columns:
             raise ValueError(
@@ -147,7 +180,7 @@ def read_chunk_records(max_rows: int | None) -> tuple[list[str], list[dict[str, 
                     "第 %s 行缺少 id/article_id/chunk_index，跳过",
                     line_number,
                 )
-                skipped += 1
+                counters["skipped"] += 1
                 continue
 
             try:
@@ -158,7 +191,7 @@ def read_chunk_records(max_rows: int | None) -> tuple[list[str], list[dict[str, 
                     line_number,
                     raw_chunk_index,
                 )
-                skipped += 1
+                counters["skipped"] += 1
                 continue
 
             text = load_summary_text(raw_summary_json)
@@ -167,20 +200,52 @@ def read_chunk_records(max_rows: int | None) -> tuple[list[str], list[dict[str, 
                     "第 %s 行 summary_json 无效/无 embedding 文本，跳过",
                     line_number,
                 )
-                skipped += 1
+                counters["skipped"] += 1
                 continue
 
+            row_hash = make_row_hash(row)
+            if chunk_id in seen_hashes:
+                if seen_hashes[chunk_id] == row_hash:
+                    LOGGER.info(
+                        "第 %s 行 id=%s 重复且内容一致，忽略",
+                        line_number,
+                        chunk_id,
+                    )
+                    counters["duplicate_identical"] += 1
+                else:
+                    LOGGER.warning(
+                        "第 %s 行 id=%s 重复但内容不同，按约定忽略新行。旧 hash=%s，新 hash=%s",
+                        line_number,
+                        chunk_id,
+                        seen_hashes[chunk_id],
+                        row_hash,
+                    )
+                    counters["duplicate_changed"] += 1
+                continue
+
+            seen_hashes[chunk_id] = row_hash
             texts.append(text)
-            metadata_rows.append(
+            chunk_rows.append(
                 {
                     "id": chunk_id,
                     "article_id": article_id,
                     "chunk_index": chunk_index,
+                    "content": (row.get("content") or ""),
+                    "summary": (row.get("summary") or ""),
+                    "summary_json": raw_summary_json,
+                    "row_hash": row_hash,
+                    "created_at": (row.get("created_at") or ""),
                 }
             )
 
-    LOGGER.info("读取到 %d 条有效记录，跳过 %d 条", len(texts), skipped)
-    return texts, metadata_rows, skipped
+    LOGGER.info(
+        "有效记录=%d，跳过=%d，重复一致=%d，重复冲突=%d",
+        len(texts),
+        counters["skipped"],
+        counters["duplicate_identical"],
+        counters["duplicate_changed"],
+    )
+    return texts, chunk_rows, counters
 
 
 def build_index(vectors: np.ndarray) -> faiss.IndexIDMap2:
@@ -204,8 +269,11 @@ def write_sqlite_metadata(
     model_path: str,
     row_count: int,
     skipped_count: int,
+    duplicate_changed_count: int,
+    duplicate_identical_count: int,
+    max_rows: int | None,
 ) -> None:
-    """Write metadata to an SQLite temp file."""
+    """Write faiss mapping and chunk text store to a SQLite temp file."""
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_path)
@@ -228,6 +296,25 @@ def write_sqlite_metadata(
         connection.execute(
             "CREATE INDEX idx_chunk_vectors_id ON chunk_vectors(id)"
         )
+
+        connection.execute(
+            """
+            CREATE TABLE chunk_texts (
+                id TEXT PRIMARY KEY,
+                article_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                row_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX idx_chunk_texts_article ON chunk_texts(article_id, chunk_index)"
+        )
+
         connection.execute(
             """
             CREATE TABLE build_info (
@@ -253,12 +340,38 @@ def write_sqlite_metadata(
             ],
         )
 
+        connection.executemany(
+            """
+            INSERT INTO chunk_texts(
+                id, article_id, chunk_index, content, summary, summary_json,
+                row_hash, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["id"],
+                    row["article_id"],
+                    row["chunk_index"],
+                    row["content"],
+                    row["summary"],
+                    row["summary_json"],
+                    row["row_hash"],
+                    row["created_at"],
+                )
+                for row in rows
+            ],
+        )
+
         build_info = {
             "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "model_path": model_path,
             "dimension": str(DIMENSION),
             "row_count": str(row_count),
             "skipped_count": str(skipped_count),
+            "duplicate_changed_count": str(duplicate_changed_count),
+            "duplicate_identical_count": str(duplicate_identical_count),
+            "max_rows": "null" if max_rows is None else str(max_rows),
             "text_fields": ",".join(TEXT_FIELDS),
             "metric": "inner_product_normalized",
         }
@@ -306,7 +419,7 @@ def replace_outputs_atomically(tmp_index: Path, tmp_db: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build FAISS index from results/chunks.csv"
+        description="Build FAISS index and SQLite chunk store from results/chunks.csv"
     )
     parser.add_argument(
         "--max-rows",
@@ -328,7 +441,7 @@ def main() -> int:
     LOGGER.info("加载本地模型: %s", model_path)
     model = SentenceTransformer(str(model_path), device="cpu")
 
-    texts, metadata_rows, skipped = read_chunk_records(args.max_rows)
+    texts, chunk_rows, counters = read_chunk_records(args.max_rows)
     if not texts:
         raise RuntimeError(
             "没有可写入 FAISS 的有效记录；旧的索引文件保持不动。"
@@ -363,10 +476,13 @@ def main() -> int:
         LOGGER.info("写入临时 SQLite 文件: %s", tmp_db)
         write_sqlite_metadata(
             tmp_db,
-            metadata_rows,
+            chunk_rows,
             model_path=str(model_path),
-            row_count=len(metadata_rows),
-            skipped_count=skipped,
+            row_count=len(chunk_rows),
+            skipped_count=counters["skipped"],
+            duplicate_changed_count=counters["duplicate_changed"],
+            duplicate_identical_count=counters["duplicate_identical"],
+            max_rows=args.max_rows,
         )
         LOGGER.info("原子替换最终输出文件")
         replace_outputs_atomically(tmp_index, tmp_db)
@@ -379,7 +495,7 @@ def main() -> int:
         "完成: %s / %s，共写入 %d 条向量",
         FAISS_INDEX_PATH,
         SQLITE_INDEX_PATH,
-        len(metadata_rows),
+        len(chunk_rows),
     )
     return 0
 
