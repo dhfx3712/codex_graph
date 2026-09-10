@@ -237,3 +237,21 @@ for hit in hits:
 - `summary_json` 返回的是解析后的 Python `dict`
 - 查询文本直接传自然语言字符串，不要传 JSON
 - `search()` 每次会重新加载模型和索引，适合低频单次查询；高频批量查询建议进一步做模型/索引复用
+
+
+
+
+• 已创建清理脚本 dedupe_undo_articles.py，并已执行。
+
+  - 判断规则：按文件名比较 articles/undo 与 articles/do
+  - 重复时提示“已处理”并删除对应 undo 文件
+  - 本次结果：发现并删除 articles/undo/二战后电子信息.md
+  - 其余 11 个 undo 文件未匹配，保留
+
+  用法：
+
+  python3 dedupe_undo_articles.py          # 实际删除
+  python3 dedupe_undo_articles.py --dry-run  # 只查看，不删除
+
+
+

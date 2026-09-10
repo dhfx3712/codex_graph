@@ -15,6 +15,8 @@ from pathlib import Path
 
 import requests
 
+csv.field_size_limit(sys.maxsize)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 ARTICLES_DIR = BASE_DIR / "articles"
@@ -210,11 +212,22 @@ def load_existing_ids(csv_path: Path) -> set[str]:
         return set()
 
     with csv_path.open("r", encoding="utf-8-sig", newline="") as fp:
-        reader = csv.DictReader(fp)
-        if not reader.fieldnames:
+        reader = csv.reader(fp)
+        try:
+            header = next(reader)
+        except StopIteration:
             return set()
-        return {row["id"] for row in reader if row.get("id")}
 
+        try:
+            id_index = header.index("id")
+        except (ValueError, AttributeError):
+            return set()
+
+        return {
+            row[id_index]
+            for row in reader
+            if len(row) > id_index and row[id_index]
+        }
 
 def ensure_header(csv_path: Path, fieldnames: list[str]) -> None:
     if csv_path.exists():
