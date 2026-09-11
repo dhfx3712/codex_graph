@@ -1,0 +1,1151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>图网络浏览</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f141b;
+      --panel: #12161e;
+      --panel-2: #161d28;
+      --border: #2a3546;
+      --text: #d8e0ea;
+      --muted: #8ea0b5;
+      --accent: #4ea1ff;
+      --accent-2: #f4a261;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                   "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+    button, input, select {
+      font: inherit;
+    }
+    button {
+      border: 1px solid var(--border);
+      background: #1c2532;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 7px 10px;
+      cursor: pointer;
+    }
+    button:hover, button.active {
+      border-color: var(--accent);
+      background: #24344a;
+    }
+    input, select {
+      border: 1px solid var(--border);
+      background: #0f141b;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 7px 8px;
+      outline: none;
+    }
+    input:focus, select:focus {
+      border-color: var(--accent);
+    }
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    #toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      background: var(--panel-2);
+      border-bottom: 1px solid var(--border);
+      z-index: 5;
+    }
+    .search-wrap {
+      position: relative;
+      flex: 1 1 300px;
+      max-width: 520px;
+    }
+    #searchInput {
+      width: 100%;
+    }
+    #searchResults {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      right: 0;
+      max-height: 380px;
+      overflow: auto;
+      background: #1a222e;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: 0 14px 34px rgba(0, 0, 0, .38);
+      display: none;
+      z-index: 30;
+    }
+    #searchResults button {
+      display: block;
+      width: 100%;
+      text-align: left;
+      border: 0;
+      border-bottom: 1px solid #243142;
+      border-radius: 0;
+      background: transparent;
+      padding: 9px 10px;
+    }
+    #searchResults button:last-child { border-bottom: 0; }
+    #searchResults button:hover { background: #24344a; }
+    .sub { color: var(--muted); font-size: 12px; }
+    .label-control {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    #coreCount { width: 70px; }
+    #stats {
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    #workspace {
+      flex: 1;
+      display: flex;
+      min-height: 0;
+    }
+    #canvasWrap {
+      flex: 1;
+      position: relative;
+      min-width: 0;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+    }
+    canvas.dragging { cursor: grabbing; }
+    #hint {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      color: var(--muted);
+      pointer-events: none;
+      text-align: center;
+    }
+    #tooltip {
+      position: fixed;
+      display: none;
+      pointer-events: none;
+      background: rgba(7, 10, 15, .92);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 7px 9px;
+      max-width: 420px;
+      color: var(--text);
+      font-size: 13px;
+      z-index: 50;
+      white-space: pre-line;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, .4);
+    }
+    #legend {
+      position: absolute;
+      left: 12px;
+      bottom: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 12px;
+      max-width: calc(100% - 40px);
+      padding: 8px 10px;
+      background: rgba(15, 20, 27, .82);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      backdrop-filter: blur(6px);
+      z-index: 5;
+    }
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .legend-item i {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    #detail {
+      width: 380px;
+      max-width: 46vw;
+      min-width: 300px;
+      overflow: auto;
+      background: var(--panel);
+      border-left: 1px solid var(--border);
+      padding: 14px;
+    }
+    .detail-empty {
+      color: var(--muted);
+      padding: 24px 6px;
+      line-height: 1.7;
+      font-size: 14px;
+    }
+    .detail-empty strong { color: var(--text); }
+    .node-title, .edge-title {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+      margin-bottom: 10px;
+    }
+    h1, h2, h3 { margin: 0; }
+    .node-title h2 { font-size: 20px; line-height: 1.35; word-break: break-all; }
+    .edge-title h2 { font-size: 16px; line-height: 1.45; word-break: break-all; }
+    .close {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 22px;
+      line-height: 1;
+      padding: 0 0 0 10px;
+    }
+    .badges { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+    .badge {
+      display: inline-block;
+      border: 1px solid #334256;
+      background: #18212d;
+      color: #c8d4e3;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 12px;
+    }
+    .kv { display: grid; grid-template-columns: 92px 1fr; row-gap: 7px; margin: 10px 0; }
+    .kv dt { color: var(--muted); font-size: 13px; }
+    .kv dd { margin: 0; font-size: 13px; }
+    .section { margin-top: 14px; }
+    .section h3 {
+      color: #b7c6d8;
+      font-size: 13px;
+      margin: 0 0 7px;
+      letter-spacing: .02em;
+    }
+    .evidence {
+      background: #101722;
+      border: 1px solid #223044;
+      border-radius: 7px;
+      padding: 8px 9px;
+      margin-bottom: 7px;
+      color: #c4d1e0;
+      font-size: 13px;
+      line-height: 1.6;
+      word-break: break-word;
+    }
+    .aliases {
+      color: #a9bcd3;
+      font-size: 13px;
+      line-height: 1.6;
+      word-break: break-all;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+    .relation-entry {
+      margin-bottom: 10px;
+      padding: 9px;
+      border: 1px solid #223044;
+      border-radius: 8px;
+      background: #101722;
+    }
+    .relation-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 5px;
+      color: #c8d4e3;
+      font-weight: 600;
+    }
+    .relation-count { color: var(--muted); font-size: 12px; }
+    @media (max-width: 900px) {
+      #detail { width: 320px; max-width: 88vw; position: absolute; right: 0; top: 0; bottom: 0; z-index: 20; }
+      #toolbar { gap: 6px; }
+      #stats { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header id="toolbar">
+      <div class="search-wrap">
+        <input id="searchInput" type="search" autocomplete="off" placeholder="搜索节点 / 别名 / 类型">
+        <div id="searchResults"></div>
+      </div>
+      <label class="label-control">核心点数量
+        <input id="coreCount" type="number" min="1" step="1" value="200">
+      </label>
+      <button id="coreToggle">只看核心点</button>
+      <select id="nodeTypeFilter" title="按实体类型筛选">
+        <option value="">全部节点类型</option>
+      </select>
+      <select id="relationFilter" title="按关系类型筛选">
+        <option value="">全部关系类型</option>
+      </select>
+      <button id="deselectButton">清除选择</button>
+      <button id="resetViewButton">重置视图</button>
+      <span id="stats"></span>
+    </header>
+
+    <div id="workspace">
+      <div id="canvasWrap">
+        <canvas id="canvas"></canvas>
+        <div id="hint">正在加载图数据...</div>
+        <div id="legend"></div>
+      </div>
+      <aside id="detail">
+        <div class="detail-empty">
+          <strong>图网络浏览</strong><br>
+          拖拽空白处平移，滚轮缩放。<br>
+          单击节点或关系查看 evidence。<br>
+          双击节点展开其邻居；也可用下方按钮。
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <div id="tooltip"></div>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      const canvasWrap = document.getElementById('canvasWrap');
+      const detail = document.getElementById('detail');
+      const hint = document.getElementById('hint');
+      const tooltip = document.getElementById('tooltip');
+      const legend = document.getElementById('legend');
+      const searchInput = document.getElementById('searchInput');
+      const searchResults = document.getElementById('searchResults');
+      const coreCountInput = document.getElementById('coreCount');
+      const coreToggle = document.getElementById('coreToggle');
+      const nodeTypeFilter = document.getElementById('nodeTypeFilter');
+      const relationFilter = document.getElementById('relationFilter');
+      const deselectButton = document.getElementById('deselectButton');
+      const resetViewButton = document.getElementById('resetViewButton');
+      const stats = document.getElementById('stats');
+
+      const state = {
+        data: null,
+        nodes: [],
+        edges: [],
+        byId: new Map(),
+        edgeById: new Map(),
+        adjacency: new Map(),
+        nodeEdges: new Map(),
+        coreIds: [],
+        typeColors: {},
+        visibleNodes: [],
+        visibleEdges: [],
+        visibleNodeSet: new Set(),
+        selectedNodeId: null,
+        selectedEdgeId: null,
+        hoverNodeId: null,
+        hoverEdgeId: null,
+        expandedRoots: new Set(),
+        coreMode: false,
+        coreCount: 200,
+        nodeType: '',
+        relationType: '',
+        view: { x: 0, y: 0, scale: 1 },
+        width: 0,
+        height: 0,
+        mouse: { x: null, y: null, down: false, panning: false, startX: 0, startY: 0, viewX: 0, viewY: 0 }
+      };
+
+      function escapeHtml(value) {
+        return String(value ?? '')
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#039;');
+      }
+
+      function nodeScreen(node) {
+        return {
+          x: node.x * state.view.scale + state.view.x,
+          y: node.y * state.view.scale + state.view.y
+        };
+      }
+
+      function screenToWorld(sx, sy) {
+        return {
+          x: (sx - state.view.x) / state.view.scale,
+          y: (sy - state.view.y) / state.view.scale
+        };
+      }
+
+      function nodeRadius(node) {
+        const base = Math.max(3, Math.min(18, Number(node.size) || 6));
+        if (node.id === state.selectedNodeId || node.id === state.hoverNodeId) return base + 3;
+        return base;
+      }
+
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      function resize() {
+        const rect = canvasWrap.getBoundingClientRect();
+        state.width = Math.max(1, rect.width);
+        state.height = Math.max(1, rect.height);
+        canvas.width = Math.round(state.width * window.devicePixelRatio);
+        canvas.height = Math.round(state.height * window.devicePixelRatio);
+        canvas.style.width = state.width + 'px';
+        canvas.style.height = state.height + 'px';
+        scheduleDraw();
+      }
+
+      function fitVisible(padding = 80) {
+        const nodes = state.visibleNodes.length ? state.visibleNodes : state.nodes;
+        if (!nodes.length) return;
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        for (const node of nodes) {
+          const r = nodeRadius(node) + 10;
+          minX = Math.min(minX, node.x - r);
+          maxX = Math.max(maxX, node.x + r);
+          minY = Math.min(minY, node.y - r);
+          maxY = Math.max(maxY, node.y + r);
+        }
+        const worldW = Math.max(1, maxX - minX);
+        const worldH = Math.max(1, maxY - minY);
+        const scale = clamp(
+          Math.min((state.width - padding * 2) / worldW, (state.height - padding * 2) / worldH),
+          0.01,
+          3
+        );
+        const centerX = (minX + maxX) / 2;
+        const centerY = (minY + maxY) / 2;
+        state.view.scale = scale;
+        state.view.x = state.width / 2 - centerX * scale;
+        state.view.y = state.height / 2 - centerY * scale;
+        scheduleDraw();
+      }
+
+      function centerOnNode(nodeId, targetScale = 0.7) {
+        const node = state.byId.get(nodeId);
+        if (!node) return;
+        state.view.scale = clamp(Number(targetScale) || 0.7, 0.05, 3);
+        state.view.x = state.width / 2 - node.x * state.view.scale;
+        state.view.y = state.height / 2 - node.y * state.view.scale;
+        scheduleDraw();
+      }
+
+      function zoomAt(sx, sy, factor) {
+        const world = screenToWorld(sx, sy);
+        const newScale = clamp(state.view.scale * factor, 0.01, 3);
+        state.view.scale = newScale;
+        state.view.x = sx - world.x * newScale;
+        state.view.y = sy - world.y * newScale;
+        scheduleDraw();
+      }
+
+      function buildSearchIndex() {
+        return state.nodes.map(node => {
+          const haystack = [
+            node.name, node.type, node.type_simple,
+            ...(node.aliases || [])
+          ].join(' ').toLowerCase();
+          return { node, haystack };
+        });
+      }
+
+      const searchIndex = { items: [], ready: false };
+      function ensureSearchIndex() {
+        if (!searchIndex.ready) {
+          searchIndex.items = buildSearchIndex();
+          searchIndex.ready = true;
+        }
+      }
+
+      function updateSearchResults(query) {
+        ensureSearchIndex();
+        const term = (query || '').trim().toLowerCase();
+        if (!term) {
+          searchResults.style.display = 'none';
+          return;
+        }
+        const matches = searchIndex.items
+          .filter(item => item.haystack.includes(term))
+          .map(item => item.node)
+          .sort((a, b) => (b.degree - a.degree) || (b.mentions - a.mentions))
+          .slice(0, 15);
+        if (!matches.length) {
+          searchResults.innerHTML = '<button disabled>没有匹配节点</button>';
+          searchResults.style.display = 'block';
+          return;
+        }
+        searchResults.innerHTML = matches.map(node => `
+          <button data-id="${escapeHtml(node.id)}">
+            <strong>${escapeHtml(node.name)}</strong>
+            <span class="sub"> · ${escapeHtml(node.type_simple || node.type || '未知')} · 度 ${node.degree} · 入 ${node.in_degree ?? 0} / 出 ${node.out_degree ?? 0}</span>
+          </button>
+        `).join('');
+        searchResults.style.display = 'block';
+      }
+
+      function selectNode(id, center = true) {
+        const node = state.byId.get(id);
+        if (!node) return;
+        state.selectedNodeId = id;
+        state.selectedEdgeId = null;
+        renderDetail();
+        if (center) centerOnNode(id, 0.7);
+        scheduleDraw();
+      }
+
+      function selectEdge(id) {
+        const edge = state.edgeById.get(id);
+        if (!edge) return;
+        state.selectedEdgeId = id;
+        state.selectedNodeId = null;
+        renderDetail();
+        scheduleDraw();
+      }
+
+      function clearSelection() {
+        state.selectedNodeId = null;
+        state.selectedEdgeId = null;
+        renderDetail();
+        scheduleDraw();
+      }
+
+      function expandNode(nodeId) {
+        state.expandedRoots.add(nodeId);
+        if (!state.coreMode) {
+          state.coreMode = true;
+          coreToggle.classList.add('active');
+          coreToggle.textContent = '关闭核心视图';
+        }
+        rebuildVisible();
+        fitVisible(90);
+        renderDetail();
+        scheduleDraw();
+      }
+
+      function toggleCoreMode() {
+        state.coreMode = !state.coreMode;
+        coreToggle.classList.toggle('active', state.coreMode);
+        coreToggle.textContent = state.coreMode ? '关闭核心视图' : '只看核心点';
+        rebuildVisible();
+        fitVisible(90);
+        scheduleDraw();
+      }
+
+      function getCoreSet() {
+        const set = new Set(state.coreIds.slice(0, state.coreCount));
+        for (const rootId of state.expandedRoots) {
+          set.add(rootId);
+          const neighbors = state.adjacency.get(rootId);
+          if (neighbors) {
+            for (const neighbor of neighbors) set.add(neighbor);
+          }
+        }
+        return set;
+      }
+
+      function computeVisibleNodeSet() {
+        if (!state.coreMode && !state.nodeType) {
+          return new Set(state.nodes.map(node => node.id));
+        }
+        let set = state.coreMode ? getCoreSet() : new Set(state.nodes.map(node => node.id));
+        if (state.nodeType) {
+          const filtered = new Set();
+          for (const id of set) {
+            const node = state.byId.get(id);
+            if (node && node.type_simple === state.nodeType) filtered.add(id);
+          }
+          set = filtered;
+        }
+        return set;
+      }
+
+      function rebuildVisible() {
+        const nodeSet = computeVisibleNodeSet();
+        state.visibleNodeSet = nodeSet;
+        state.visibleNodes = state.nodes.filter(node => nodeSet.has(node.id));
+
+        let visibleEdges = [];
+        for (const edge of state.edges) {
+          if (!nodeSet.has(edge.source) || !nodeSet.has(edge.target)) continue;
+          if (state.relationType && !edge.relations.some(rel => rel.relation === state.relationType)) continue;
+          visibleEdges.push(edge);
+        }
+        state.visibleEdges = visibleEdges;
+        updateStats();
+      }
+
+      function updateStats() {
+        stats.textContent = `可见节点 ${state.visibleNodes.length}/${state.nodes.length} · 可见关系 ${state.visibleEdges.length}/${state.edges.length}`;
+      }
+
+      function renderDetail() {
+        if (state.selectedNodeId) {
+          const node = state.byId.get(state.selectedNodeId);
+          if (!node) return;
+          const aliases = (node.aliases || []);
+          detail.innerHTML = `
+            <div class="node-title">
+              <h2>${escapeHtml(node.name)}</h2>
+              <button class="close" data-action="clear" title="关闭">×</button>
+            </div>
+            <div class="badges">
+              <span class="badge">${escapeHtml(node.type_simple || '未知')}</span>
+              <span class="badge">原始类型：${escapeHtml(node.type || '未知')}</span>
+            </div>
+            <dl class="kv">
+              <dt>度</dt><dd>${node.degree}</dd>
+              <dt>入度 / 出度</dt><dd>${node.in_degree} / ${node.out_degree}</dd>
+              <dt>加权度</dt><dd>${Math.round(node.weighted_degree)}</dd>
+              <dt>出现次数</dt><dd>${node.mentions || 0}</dd>
+            </dl>
+            ${aliases.length ? `<div class="section"><h3>别名</h3><div class="aliases">${aliases.map(escapeHtml).join('、')}</div></div>` : ''}
+            <div class="section">
+              <h3>Evidence</h3>
+              ${(node.evidence || []).length ? node.evidence.map(item => `<div class="evidence">${escapeHtml(item)}</div>`).join('') : '<div class="evidence">无 evidence</div>'}
+            </div>
+            <div class="actions">
+              <button data-id="${escapeHtml(node.id)}" data-action="expand">展开邻居</button>
+              <button data-id="${escapeHtml(node.id)}" data-action="center">居中查看</button>
+              <button data-id="${escapeHtml(node.id)}" data-action="neighbors">查看邻居列表</button>
+              <button data-action="clear">清除选择</button>
+            </div>
+          `;
+          return;
+        }
+
+        if (state.selectedEdgeId) {
+          const edge = state.edgeById.get(state.selectedEdgeId);
+          if (!edge) return;
+          const source = state.byId.get(edge.source);
+          const target = state.byId.get(edge.target);
+          detail.innerHTML = `
+            <div class="edge-title">
+              <h2>${escapeHtml(source ? source.name : edge.source)} → ${escapeHtml(target ? target.name : edge.target)}</h2>
+              <button class="close" data-action="clear" title="关闭">×</button>
+            </div>
+            <dl class="kv">
+              <dt>关系权重</dt><dd>${edge.weight}</dd>
+              <dt>关系种类</dt><dd>${edge.relations.length}</dd>
+            </dl>
+            <div class="section">
+              <h3>Relationships</h3>
+              ${edge.relations.map(rel => `
+                <div class="relation-entry">
+                  <div class="relation-head">
+                    <span>${escapeHtml(rel.relation)}</span>
+                    <span class="relation-count">${rel.count} 次</span>
+                  </div>
+                  ${(rel.evidence || []).length ? rel.evidence.map(item => `<div class="evidence">${escapeHtml(item)}</div>`).join('') : '<div class="evidence">无 evidence</div>'}
+                </div>
+              `).join('')}
+            </div>
+            <div class="actions">
+              <button data-id="${escapeHtml(edge.source)}" data-action="focus-node">查看源节点</button>
+              <button data-id="${escapeHtml(edge.target)}" data-action="focus-node">查看目标节点</button>
+              <button data-action="clear">清除选择</button>
+            </div>
+          `;
+          return;
+        }
+
+        detail.innerHTML = `
+          <div class="detail-empty">
+            <strong>图网络浏览</strong><br>
+            拖拽空白处平移，滚轮缩放。<br>
+            单击节点或关系查看 evidence。<br>
+            双击节点展开其邻居；也可用下方按钮。
+          </div>
+        `;
+      }
+
+      function renderLegend() {
+        if (!state.data) return;
+        const distribution = state.data.meta.type_distribution || {};
+        const items = Object.entries(state.typeColors).map(([type, color]) => `
+          <span class="legend-item"><i style="background:${color}"></i>${escapeHtml(type)} (${distribution[type] || 0})</span>
+        `).join('');
+        legend.innerHTML = items;
+      }
+
+      function populateFilters() {
+        const nodeTypes = Object.keys(state.data.meta.type_distribution || {});
+        nodeTypes.forEach(type => {
+          const option = document.createElement('option');
+          option.value = type;
+          option.textContent = type;
+          nodeTypeFilter.appendChild(option);
+        });
+
+        const relationTypes = Object.keys(state.data.meta.relation_distribution || {});
+        relationTypes.forEach(type => {
+          const option = document.createElement('option');
+          option.value = type;
+          option.textContent = type;
+          relationFilter.appendChild(option);
+        });
+      }
+
+      let drawScheduled = false;
+      function scheduleDraw() {
+        if (drawScheduled) return;
+        drawScheduled = true;
+        requestAnimationFrame(() => {
+          drawScheduled = false;
+          draw();
+        });
+      }
+
+      function draw() {
+        ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
+        ctx.clearRect(0, 0, state.width, state.height);
+
+        if (!state.data) {
+          ctx.fillStyle = '#8ea0b5';
+          ctx.font = '14px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('正在加载图数据...', state.width / 2, state.height / 2);
+          return;
+        }
+
+        const scale = state.view.scale;
+        const viewX = state.view.x;
+        const viewY = state.view.y;
+        const selectedId = state.selectedNodeId;
+        const hoverEdgeId = state.hoverEdgeId;
+        const hoverNodeId = state.hoverNodeId;
+        const named = new Set();
+        if (selectedId) {
+          const neighbors = state.adjacency.get(selectedId);
+          if (neighbors) for (const id of neighbors) named.add(id);
+        }
+
+        const screenPoints = new Map();
+        for (const node of state.visibleNodes) {
+          screenPoints.set(node.id, [node.x * scale + viewX, node.y * scale + viewY]);
+        }
+
+        const normalEdges = [];
+        const highlightEdges = [];
+        for (const edge of state.visibleEdges) {
+          const p1 = screenPoints.get(edge.source);
+          const p2 = screenPoints.get(edge.target);
+          if (!p1 || !p2) continue;
+          const isSelected = selectedId && (edge.source === selectedId || edge.target === selectedId);
+          const isHover = edge.id === hoverEdgeId;
+          (isSelected || isHover ? highlightEdges : normalEdges).push({ edge, p1, p2, isHover });
+        }
+
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(138, 155, 175, 0.24)';
+        ctx.beginPath();
+        for (const item of normalEdges) {
+          ctx.moveTo(item.p1[0], item.p1[1]);
+          ctx.lineTo(item.p2[0], item.p2[1]);
+        }
+        ctx.stroke();
+
+        for (const item of highlightEdges) {
+          ctx.lineWidth = item.isHover ? 2.5 : 1.8;
+          ctx.strokeStyle = item.isHover ? '#ffb703' : '#f4a261';
+          ctx.beginPath();
+          ctx.moveTo(item.p1[0], item.p1[1]);
+          ctx.lineTo(item.p2[0], item.p2[1]);
+          ctx.stroke();
+          drawArrow(item.p1, item.p2, state.byId.get(item.edge.target), ctx.strokeStyle);
+        }
+
+        if (scale > 0.45 && state.visibleEdges.length < 600) {
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = 'rgba(190, 203, 220, 0.32)';
+          for (const item of normalEdges.slice(0, 600)) {
+            drawArrow(item.p1, item.p2, state.byId.get(item.edge.target), ctx.strokeStyle);
+          }
+        }
+
+        const visibleCount = state.visibleNodes.length;
+        const labelCandidates = [];
+
+        for (const node of state.visibleNodes) {
+          const p = screenPoints.get(node.id);
+          if (!p) continue;
+          const r = nodeRadius(node);
+          const isHover = node.id === hoverNodeId;
+          const isSelected = node.id === selectedId;
+          const isNeighbor = selectedId && named.has(node.id);
+          const fill = state.typeColors[node.type_simple] || '#888888';
+
+          ctx.beginPath();
+          ctx.arc(p[0], p[1], r, 0, Math.PI * 2);
+          ctx.fillStyle = fill;
+          ctx.globalAlpha = isHover || isSelected ? 0.98 : 0.82;
+          ctx.fill();
+          ctx.globalAlpha = 1;
+          ctx.lineWidth = isHover || isSelected ? 2.5 : 1;
+          ctx.strokeStyle = isSelected ? '#ffffff' : isHover ? '#ffd166' : isNeighbor ? '#9ad0ff' : 'rgba(0,0,0,0.38)';
+          ctx.stroke();
+
+          const showLabel =
+            isSelected ||
+            isHover ||
+            visibleCount <= 220 ||
+            (scale > 0.35 && node.degree >= 8) ||
+            (scale > 0.18 && node.degree >= 25) ||
+            (state.coreMode && node.degree >= 4);
+
+          if (showLabel && labelCandidates.length < 650) {
+            labelCandidates.push({ node, p, r, isSelected, isHover });
+          }
+        }
+
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        for (const item of labelCandidates) {
+          const fontSize = item.isSelected || item.isHover ? 13 : 11;
+          ctx.font = `${fontSize}px "PingFang SC", "Microsoft YaHei", sans-serif`;
+          const x = item.p[0];
+          const y = item.p[1] + item.r + 10;
+          const degreeText = `入 ${item.node.in_degree ?? 0} · 出 ${item.node.out_degree ?? 0}`;
+          const degreeY = y + fontSize + 4;
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = 'rgba(8, 10, 15, 0.72)';
+          ctx.strokeText(item.node.name, x, y);
+          ctx.fillStyle = '#edf2f7';
+          ctx.fillText(item.node.name, x, y);
+          ctx.strokeText(degreeText, x, degreeY);
+          ctx.fillText(degreeText, x, degreeY);
+        }
+      }
+
+      function drawArrow(p1, p2, targetNode, color) {
+        const angle = Math.atan2(p2[1] - p1[1], p2[0] - p1[0]);
+        const targetR = targetNode ? Math.max(3, Math.min(18, targetNode.size || 6)) : 0;
+        const arrowOriginX = p2[0] - Math.cos(angle) * (targetR + 3);
+        const arrowOriginY = p2[1] - Math.sin(angle) * (targetR + 3);
+        const arrowLength = 7;
+        const wing = 0.42;
+        ctx.beginPath();
+        ctx.moveTo(arrowOriginX, arrowOriginY);
+        ctx.lineTo(
+          arrowOriginX - arrowLength * Math.cos(angle - wing),
+          arrowOriginY - arrowLength * Math.sin(angle - wing)
+        );
+        ctx.moveTo(arrowOriginX, arrowOriginY);
+        ctx.lineTo(
+          arrowOriginX - arrowLength * Math.cos(angle + wing),
+          arrowOriginY - arrowLength * Math.sin(angle + wing)
+        );
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+      }
+
+      function pickNode(cssX, cssY) {
+        let best = null;
+        let bestDistance = Infinity;
+        for (const node of state.visibleNodes) {
+          const sx = node.x * state.view.scale + state.view.x;
+          const sy = node.y * state.view.scale + state.view.y;
+          const r = Math.max(nodeRadius(node) + 3, 7);
+          const dx = sx - cssX;
+          const dy = sy - cssY;
+          const distance = Math.hypot(dx, dy);
+          if (distance < r && distance < bestDistance) {
+            best = node;
+            bestDistance = distance;
+          }
+        }
+        return best;
+      }
+
+      function distanceToSegment(px, py, x1, y1, x2, y2) {
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const lengthSquared = dx * dx + dy * dy;
+        if (lengthSquared === 0) return Math.hypot(px - x1, py - y1);
+        let t = ((px - x1) * dx + (py - y1) * dy) / lengthSquared;
+        t = clamp(t, 0, 1);
+        const crossX = x1 + t * dx;
+        const crossY = y1 + t * dy;
+        return Math.hypot(px - crossX, py - crossY);
+      }
+
+      function pickEdge(cssX, cssY) {
+        let best = null;
+        let bestDistance = 7;
+        for (const edge of state.visibleEdges) {
+          const source = state.byId.get(edge.source);
+          const target = state.byId.get(edge.target);
+          if (!source || !target) continue;
+          const x1 = source.x * state.view.scale + state.view.x;
+          const y1 = source.y * state.view.scale + state.view.y;
+          const x2 = target.x * state.view.scale + state.view.x;
+          const y2 = target.y * state.view.scale + state.view.y;
+          const distance = distanceToSegment(cssX, cssY, x1, y1, x2, y2);
+          if (distance < bestDistance) {
+            best = edge;
+            bestDistance = distance;
+          }
+        }
+        return best;
+      }
+
+      function getCanvasPosition(event) {
+        const rect = canvas.getBoundingClientRect();
+        return {
+          x: event.clientX - rect.left,
+          y: event.clientY - rect.top
+        };
+      }
+
+      function hideTooltip() {
+        tooltip.style.display = 'none';
+      }
+
+      function showTooltip(text, clientX, clientY) {
+        tooltip.textContent = text;
+        tooltip.style.display = 'block';
+        const width = Math.min(420, window.innerWidth - 24);
+        tooltip.style.maxWidth = width + 'px';
+        let left = clientX + 14;
+        let top = clientY + 14;
+        const rect = tooltip.getBoundingClientRect();
+        if (left + rect.width > window.innerWidth - 12) left = clientX - rect.width - 14;
+        if (top + rect.height > window.innerHeight - 12) top = clientY - rect.height - 14;
+        tooltip.style.left = Math.max(8, left) + 'px';
+        tooltip.style.top = Math.max(8, top) + 'px';
+      }
+
+      canvas.addEventListener('mousedown', event => {
+        const pos = getCanvasPosition(event);
+        const node = pickNode(pos.x, pos.y);
+        if (node) {
+          selectNode(node.id, false);
+          event.preventDefault();
+          return;
+        }
+        const edge = pickEdge(pos.x, pos.y);
+        if (edge) {
+          selectEdge(edge.id);
+          event.preventDefault();
+          return;
+        }
+        clearSelection();
+        state.mouse.down = true;
+        state.mouse.panning = true;
+        state.mouse.startX = pos.x;
+        state.mouse.startY = pos.y;
+        state.mouse.viewX = state.view.x;
+        state.mouse.viewY = state.view.y;
+        canvas.classList.add('dragging');
+      });
+
+      canvas.addEventListener('mousemove', event => {
+        const pos = getCanvasPosition(event);
+        state.mouse.x = pos.x;
+        state.mouse.y = pos.y;
+        if (state.mouse.panning) {
+          state.view.x = state.mouse.viewX + (pos.x - state.mouse.startX);
+          state.view.y = state.mouse.viewY + (pos.y - state.mouse.startY);
+          scheduleDraw();
+          return;
+        }
+
+        const node = pickNode(pos.x, pos.y);
+        const edge = !node ? pickEdge(pos.x, pos.y) : null;
+        state.hoverNodeId = node ? node.id : null;
+        state.hoverEdgeId = edge ? edge.id : null;
+        canvas.style.cursor = node ? 'pointer' : edge ? 'pointer' : 'grab';
+
+        if (node) {
+          const relCount = (state.nodeEdges.get(node.id) || []).length;
+          showTooltip(`${node.name}\n类型：${node.type_simple || '未知'} · 度：${node.degree}\n入度：${node.in_degree ?? 0} · 出度：${node.out_degree ?? 0}\n关系：${relCount} 条 · 出现：${node.mentions || 0} 次`, event.clientX, event.clientY);
+        } else if (edge) {
+          const labels = edge.relations.map(rel => rel.relation).join('、');
+          const source = state.byId.get(edge.source);
+          const target = state.byId.get(edge.target);
+          showTooltip(`${source ? source.name : edge.source} → ${target ? target.name : edge.target}\n关系：${labels}`, event.clientX, event.clientY);
+        } else {
+          hideTooltip();
+        }
+        scheduleDraw();
+      });
+
+      canvas.addEventListener('dblclick', event => {
+        const pos = getCanvasPosition(event);
+        const node = pickNode(pos.x, pos.y);
+        if (node) {
+          expandNode(node.id);
+          event.preventDefault();
+        }
+      });
+
+      canvas.addEventListener('wheel', event => {
+        event.preventDefault();
+        const pos = getCanvasPosition(event);
+        const factor = event.deltaY < 0 ? 1.12 : 0.89;
+        zoomAt(pos.x, pos.y, factor);
+      }, { passive: false });
+
+      window.addEventListener('mouseup', () => {
+        state.mouse.down = false;
+        state.mouse.panning = false;
+        canvas.classList.remove('dragging');
+      });
+
+      canvas.addEventListener('mouseleave', () => {
+        state.hoverNodeId = null;
+        state.hoverEdgeId = null;
+        state.mouse.panning = false;
+        hideTooltip();
+        canvas.classList.remove('dragging');
+        scheduleDraw();
+      });
+
+      searchInput.addEventListener('input', () => {
+        updateSearchResults(searchInput.value);
+      });
+      searchInput.addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+          const first = searchResults.querySelector('button[data-id]');
+          if (first) first.click();
+        }
+      });
+      document.addEventListener('click', event => {
+        if (!event.target.closest('.search-wrap')) {
+          searchResults.style.display = 'none';
+        }
+      });
+      searchResults.addEventListener('mousedown', event => {
+        const button = event.target.closest('button[data-id]');
+        if (!button) return;
+        event.preventDefault();
+        const id = button.getAttribute('data-id');
+        searchInput.value = state.byId.get(id)?.name || id;
+        searchResults.style.display = 'none';
+        selectNode(id, true);
+      });
+
+      detail.addEventListener('click', event => {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        const action = button.getAttribute('data-action');
+        const id = button.getAttribute('data-id');
+        if (action === 'clear') clearSelection();
+        if (action === 'center' && id) centerOnNode(id, 0.7);
+        if (action === 'expand' && id) expandNode(id);
+        if (action === 'focus-node' && id) selectNode(id, true);
+        if (action === 'neighbors' && id) {
+          const neighbors = state.adjacency.get(id) || new Set();
+          const nearby = [...neighbors].sort((a, b) => (state.byId.get(b)?.degree || 0) - (state.byId.get(a)?.degree || 0)).slice(0, 12);
+          const neighborButtons = nearby.map(neighborId => {
+            const neighbor = state.byId.get(neighborId);
+            return neighbor ? `<button data-id="${escapeHtml(neighbor.id)}" data-action="center">${escapeHtml(neighbor.name)}</button>` : '';
+          }).join('');
+          const oldTitle = detail.querySelector('.node-title h2');
+          if (oldTitle && nearby.length) {
+            oldTitle.insertAdjacentHTML('afterend', `<div class="section"><h3>邻居节点</h3><div class="actions">${neighborButtons}</div></div>`);
+          }
+        }
+      });
+
+      coreToggle.addEventListener('click', toggleCoreMode);
+      deselectButton.addEventListener('click', clearSelection);
+      resetViewButton.addEventListener('click', () => fitVisible(80));
+      coreCountInput.addEventListener('change', () => {
+        state.coreCount = Math.max(1, Number(coreCountInput.value) || 200);
+        if (state.coreMode) {
+          rebuildVisible();
+          fitVisible(80);
+          scheduleDraw();
+        }
+      });
+      nodeTypeFilter.addEventListener('change', () => {
+        state.nodeType = nodeTypeFilter.value;
+        rebuildVisible();
+        fitVisible(80);
+        scheduleDraw();
+      });
+      relationFilter.addEventListener('change', () => {
+        state.relationType = relationFilter.value;
+        rebuildVisible();
+        scheduleDraw();
+      });
+
+      window.addEventListener('resize', resize);
+
+      async function init() {
+        try {
+          const response = await fetch('graph_data.json', { cache: 'no-store' });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const data = await response.json();
+          state.data = data;
+          state.nodes = data.nodes || [];
+          state.edges = data.edges || [];
+          state.typeColors = data.meta?.type_colors || {};
+
+          state.byId = new Map(state.nodes.map(node => [node.id, node]));
+          state.edgeById = new Map(state.edges.map(edge => [edge.id, edge]));
+          state.adjacency = new Map();
+          state.nodeEdges = new Map();
+          for (const id of state.nodes.map(node => node.id)) {
+            state.adjacency.set(id, new Set());
+            state.nodeEdges.set(id, []);
+          }
+          for (const edge of state.edges) {
+            const sourceNeighbors = state.adjacency.get(edge.source);
+            const targetNeighbors = state.adjacency.get(edge.target);
+            if (sourceNeighbors) sourceNeighbors.add(edge.target);
+            if (targetNeighbors) targetNeighbors.add(edge.source);
+            state.nodeEdges.get(edge.source)?.push(edge);
+            state.nodeEdges.get(edge.target)?.push(edge);
+          }
+          state.coreIds = state.nodes
+            .slice()
+            .sort((a, b) => (b.degree - a.degree) || (b.weighted_degree - a.weighted_degree))
+            .map(node => node.id);
+          state.coreCount = Math.max(1, Number(coreCountInput.value) || 200);
+
+          hint.style.display = 'none';
+          populateFilters();
+          renderLegend();
+          rebuildVisible();
+          resize();
+          fitVisible(80);
+        } catch (error) {
+          hint.innerHTML = `加载失败：${escapeHtml(String(error && error.message ? error.message : error))}`;
+        }
+      }
+
+      init();
+    })();
+  </script>
+</body>
+</html>
