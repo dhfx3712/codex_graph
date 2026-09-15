@@ -255,3 +255,13 @@ for hit in hits:
 
 
 
+
+python serve_graph.py --host 0.0.0.0 --port 6134 --public-host
+
+
+
+# 使用 AMD 的 DeepSeek 模型
+codex --profile amd-deepseek
+
+# 使用 AMD 的 Qwen 模型
+codex --profile amd-qwen

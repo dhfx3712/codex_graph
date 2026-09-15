@@ -53,7 +53,7 @@ CHUNK_FIELDS = [
     "created_at",
 ]
 
-ENV_FILE = Path("/home/ubuntu/codex_english/.env")
+ENV_FILE = Path("/home/ubuntu/codex_graphrag/.ollmam_env")
 VOLC_BASE_URL = os.getenv("VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
 MODEL_NAME = os.getenv("MODEL_NAME", "doubao-seed-2.0-lite")
 

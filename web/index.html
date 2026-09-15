@@ -376,7 +376,15 @@
         view: { x: 0, y: 0, scale: 1 },
         width: 0,
         height: 0,
-        mouse: { x: null, y: null, down: false, panning: false, startX: 0, startY: 0, viewX: 0, viewY: 0 }
+        mouse: { x: null, y: null, down: false, panning: false, startX: 0, startY: 0, viewX: 0, viewY: 0 },
+        pendingClearSelection: false,
+        draggingNodeId: null,
+        dragStartX: 0,
+        dragStartY: 0,
+        dragStartWorldX: 0,
+        dragStartWorldY: 0,
+        dragMoved: false
+
       };
 
       function escapeHtml(value) {
@@ -774,7 +782,15 @@
 
         for (const item of highlightEdges) {
           ctx.lineWidth = item.isHover ? 2.5 : 1.8;
-          ctx.strokeStyle = item.isHover ? '#ffb703' : '#f4a261';
+          let strokeColor = item.isHover ? '#ffb703' : '#f4a261';
+          if (selectedId) {
+            if (item.edge.source === selectedId) {
+              strokeColor = '#4ea1ff'; // 出边
+            } else if (item.edge.target === selectedId) {
+              strokeColor = '#f4a261'; // 入边
+            }
+          }
+          ctx.strokeStyle = strokeColor;          
           ctx.beginPath();
           ctx.moveTo(item.p1[0], item.p1[1]);
           ctx.lineTo(item.p2[0], item.p2[1]);
@@ -945,9 +961,17 @@
 
       canvas.addEventListener('mousedown', event => {
         const pos = getCanvasPosition(event);
+        state.pendingClearSelection = false;
         const node = pickNode(pos.x, pos.y);
         if (node) {
           selectNode(node.id, false);
+          state.draggingNodeId = node.id;
+          state.dragStartX = pos.x;
+          state.dragStartY = pos.y;
+          const world = screenToWorld(pos.x, pos.y);
+          state.dragStartWorldX = world.x;
+          state.dragStartWorldY = world.y;
+          state.dragMoved = false;
           event.preventDefault();
           return;
         }
@@ -957,13 +981,13 @@
           event.preventDefault();
           return;
         }
-        clearSelection();
         state.mouse.down = true;
         state.mouse.panning = true;
         state.mouse.startX = pos.x;
         state.mouse.startY = pos.y;
         state.mouse.viewX = state.view.x;
         state.mouse.viewY = state.view.y;
+        state.pendingClearSelection = true;
         canvas.classList.add('dragging');
       });
 
@@ -971,9 +995,33 @@
         const pos = getCanvasPosition(event);
         state.mouse.x = pos.x;
         state.mouse.y = pos.y;
+        if (state.draggingNodeId) {
+          const node = state.byId.get(state.draggingNodeId);
+          if (node) {
+            const dx = pos.x - state.dragStartX;
+            const dy = pos.y - state.dragStartY;
+            if (!state.dragMoved && Math.hypot(dx, dy) > 4) {
+              state.dragMoved = true;
+              canvas.style.cursor = 'grabbing';
+            }
+            if (state.dragMoved) {
+              const world = screenToWorld(pos.x, pos.y);
+              node.x += world.x - state.dragStartWorldX;
+              node.y += world.y - state.dragStartWorldY;
+              state.dragStartWorldX = world.x;
+              state.dragStartWorldY = world.y;
+              hideTooltip();
+              scheduleDraw();
+            }
+          }
+          return;
+        }
         if (state.mouse.panning) {
           state.view.x = state.mouse.viewX + (pos.x - state.mouse.startX);
           state.view.y = state.mouse.viewY + (pos.y - state.mouse.startY);
+          if (Math.hypot(pos.x - state.mouse.startX, pos.y - state.mouse.startY) > 4) {
+          state.pendingClearSelection = false;
+          }
           scheduleDraw();
           return;
         }
@@ -1015,9 +1063,16 @@
       }, { passive: false });
 
       window.addEventListener('mouseup', () => {
+          if (state.pendingClearSelection) {
+          clearSelection();
+          }
+        state.pendingClearSelection = false;
+        state.draggingNodeId = null;
+        state.dragMoved = false;          
         state.mouse.down = false;
         state.mouse.panning = false;
         canvas.classList.remove('dragging');
+        canvas.style.cursor = 'grab';
       });
 
       canvas.addEventListener('mouseleave', () => {
@@ -1032,10 +1087,24 @@
       searchInput.addEventListener('input', () => {
         updateSearchResults(searchInput.value);
       });
+
+      function chooseSearchResult(button) {
+        const id = button.getAttribute('data-id');
+        if (!id) return;
+        searchInput.value = state.byId.get(id)?.name || id;
+        searchResults.style.display = 'none';
+        selectNode(id, true);
+      }
+
       searchInput.addEventListener('keydown', event => {
         if (event.key === 'Enter') {
           const first = searchResults.querySelector('button[data-id]');
-          if (first) first.click();
+
+          if (first) {
+            event.preventDefault();
+            chooseSearchResult(first);
+          }
+
         }
       });
       document.addEventListener('click', event => {
@@ -1047,10 +1116,7 @@
         const button = event.target.closest('button[data-id]');
         if (!button) return;
         event.preventDefault();
-        const id = button.getAttribute('data-id');
-        searchInput.value = state.byId.get(id)?.name || id;
-        searchResults.style.display = 'none';
-        selectNode(id, true);
+        chooseSearchResult(button);
       });
 
       detail.addEventListener('click', event => {
