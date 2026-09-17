@@ -370,6 +370,7 @@
         hoverEdgeId: null,
         expandedRoots: new Set(),
         coreMode: false,
+        focusNodeId: null,
         coreCount: 200,
         nodeType: '',
         relationType: '',
@@ -522,6 +523,7 @@
       function selectNode(id, center = true) {
         const node = state.byId.get(id);
         if (!node) return;
+        state.focusNodeId = null; // 点击节点退出局部邻居视图，避免与 focus 耦合
         state.selectedNodeId = id;
         state.selectedEdgeId = null;
         renderDetail();
@@ -541,17 +543,16 @@
       function clearSelection() {
         state.selectedNodeId = null;
         state.selectedEdgeId = null;
+        state.focusNodeId = null;
         renderDetail();
         scheduleDraw();
       }
 
       function expandNode(nodeId) {
-        state.expandedRoots.add(nodeId);
-        if (!state.coreMode) {
-          state.coreMode = true;
-          coreToggle.classList.add('active');
-          coreToggle.textContent = '关闭核心视图';
-        }
+        // 以该节点为锚展示其入度/出度（局部邻居视图），不再切换/关闭核心视图
+        state.focusNodeId = nodeId;
+        state.selectedNodeId = nodeId;
+        state.selectedEdgeId = null;
         rebuildVisible();
         fitVisible(90);
         renderDetail();
@@ -580,6 +581,13 @@
       }
 
       function computeVisibleNodeSet() {
+        // 局部邻居视图：仅展示聚焦节点及其邻接，与 coreMode 解耦
+        if (state.focusNodeId) {
+          const set = new Set([state.focusNodeId]);
+          const neighbors = state.adjacency.get(state.focusNodeId);
+          if (neighbors) for (const n of neighbors) set.add(n);
+          return set;
+        }
         if (!state.coreMode && !state.nodeType) {
           return new Set(state.nodes.map(node => node.id));
         }
@@ -619,6 +627,22 @@
           const node = state.byId.get(state.selectedNodeId);
           if (!node) return;
           const aliases = (node.aliases || []);
+          // 入度/出度增强：列出具体邻居与关系（复用 state.nodeEdges / state.byId）
+          const nodeEdges = state.nodeEdges.get(node.id) || [];
+          const inEdgesHtml = nodeEdges
+            .filter(e => e.target === node.id)
+            .map(e => {
+              const src = state.byId.get(e.source);
+              const rels = (e.relations || []).map(r => `${escapeHtml(r.relation)}×${r.count}`).join('、');
+              return `<div class="relation-entry"><span>${escapeHtml(src ? src.name : e.source)}</span> <span class="sub">${rels || '—'}</span></div>`;
+            }).join('') || '<div class="evidence">无入边</div>';
+          const outEdgesHtml = nodeEdges
+            .filter(e => e.source === node.id)
+            .map(e => {
+              const tgt = state.byId.get(e.target);
+              const rels = (e.relations || []).map(r => `${escapeHtml(r.relation)}×${r.count}`).join('、');
+              return `<div class="relation-entry"><span>${escapeHtml(tgt ? tgt.name : e.target)}</span> <span class="sub">${rels || '—'}</span></div>`;
+            }).join('') || '<div class="evidence">无出边</div>';
           detail.innerHTML = `
             <div class="node-title">
               <h2>${escapeHtml(node.name)}</h2>
@@ -634,6 +658,14 @@
               <dt>加权度</dt><dd>${Math.round(node.weighted_degree)}</dd>
               <dt>出现次数</dt><dd>${node.mentions || 0}</dd>
             </dl>
+            <div class="section">
+              <h3>入边（来自，共 ${node.in_degree}）</h3>
+              ${inEdgesHtml}
+            </div>
+            <div class="section">
+              <h3>出边（指向，共 ${node.out_degree}）</h3>
+              ${outEdgesHtml}
+            </div>
             ${aliases.length ? `<div class="section"><h3>别名</h3><div class="aliases">${aliases.map(escapeHtml).join('、')}</div></div>` : ''}
             <div class="section">
               <h3>Evidence</h3>
