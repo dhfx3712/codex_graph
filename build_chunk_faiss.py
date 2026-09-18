@@ -125,6 +125,7 @@ def make_row_hash(row: dict[str, object]) -> str:
         "content": row.get("content", ""),
         "summary": row.get("summary", ""),
         "summary_json": row.get("summary_json", ""),
+        "context": row.get("context", ""),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -174,6 +175,7 @@ def read_chunk_records(
             article_id = (row.get("article_id") or "").strip()
             raw_chunk_index = (row.get("chunk_index") or "").strip()
             raw_summary_json = row.get("summary_json") or ""
+            raw_context = (row.get("context") or "").strip()  # 方案2：文章级全局语境
 
             if not chunk_id or not article_id or not raw_chunk_index:
                 LOGGER.warning(
@@ -202,6 +204,8 @@ def read_chunk_records(
                 )
                 counters["skipped"] += 1
                 continue
+            if raw_context:  # 方案2：语境增强检索，向量前缀文章摘要
+                text = raw_context + "\n" + text
 
             row_hash = make_row_hash(row)
             if chunk_id in seen_hashes:
@@ -233,6 +237,7 @@ def read_chunk_records(
                     "content": (row.get("content") or ""),
                     "summary": (row.get("summary") or ""),
                     "summary_json": raw_summary_json,
+                    "context": raw_context,
                     "row_hash": row_hash,
                     "created_at": (row.get("created_at") or ""),
                 }
@@ -306,6 +311,7 @@ def write_sqlite_metadata(
                 content TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 summary_json TEXT NOT NULL,
+                context TEXT NOT NULL,
                 row_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
@@ -344,9 +350,9 @@ def write_sqlite_metadata(
             """
             INSERT INTO chunk_texts(
                 id, article_id, chunk_index, content, summary, summary_json,
-                row_hash, created_at
+                context, row_hash, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -356,6 +362,7 @@ def write_sqlite_metadata(
                     row["content"],
                     row["summary"],
                     row["summary_json"],
+                    row["context"],
                     row["row_hash"],
                     row["created_at"],
                 )

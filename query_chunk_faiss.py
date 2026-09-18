@@ -71,7 +71,8 @@ def search(query: str, top_k: int) -> list[dict[str, object]]:
                 c.chunk_index,
                 t.content,
                 t.summary,
-                t.summary_json
+                t.summary_json,
+                t.context
             FROM chunk_vectors c
             JOIN chunk_texts t ON t.id = c.id
             WHERE c.faiss_id IN ({placeholders})
@@ -93,6 +94,7 @@ def search(query: str, top_k: int) -> list[dict[str, object]]:
                 "content": row[4],
                 "summary": row[5],
                 "summary_json": summary_json,
+                "context": row[7],
             }
     finally:
         connection.close()

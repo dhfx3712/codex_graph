@@ -265,3 +265,42 @@ codex --profile amd-deepseek
 
 # 使用 AMD 的 Qwen 模型
 codex --profile amd-qwen
+
+
+
+
+• 重启命令给你（唯一的服务就是 serve_graph.py，静态页服务，端口 6134，README L259 确认的启动方式；web/index.html 只 fetch 同目录的 graph_data.json，无
+  后端 API 依赖）：
+
+  ## 一条搞定：杀旧 → 起新
+
+  cd /home/ubuntu/codex_graphrag && pkill -f "serve_graph.py" ; sleep 1 && nohup .venv/bin/python serve_graph.py --host 0.0.0.0 --port 6134 --public-host > serve_graph.log 2>&1 & disown; sleep 2; ss -ltnp | grep 6134; tail -5 serve_graph.log
+
+  预期最后输出类似：
+
+  LISTEN  0  5  0.0.0.0:6134  ...  users:(("python",...))
+  图网络页面已启动：http://0.0.0.0:6134/
+
+  ## 想分两步执行
+
+  # 1. 杀旧（无匹配进程时 pkill 返回 1，属正常）
+  pkill -f "serve_graph.py"
+
+  # 2. 起新
+  cd /home/ubuntu/codex_graphrag
+  nohup .venv/bin/python serve_graph.py --host 0.0.0.0 --port 6134 --public-host  10.0.0.14> serve_graph.log 2>&1 & disown
+
+  ## 验证 / 应急
+
+  # 确认只有一个实例在跑（重复起会因端口占用失败）
+  pgrep -af serve_graph.py
+
+  # 端口被别的进程占着时，先看清占用者再决定
+  ss -ltnp | grep 6134
+
+  # 确认页面可访问
+  curl -I http://127.0.0.1:6134/
+  curl -s -o /dev/null -w "graph_data.json: %{http_code} %{size_download}B\n" http://127.0.0.1:6134/graph_data.json
+
+  需要浏览器访问外网地址时，加 --public-host <公网IP或域名>（仅用于日志提示，拒绝 TLS 请求时才用到）。
+

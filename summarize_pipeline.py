@@ -48,6 +48,7 @@ CHUNK_FIELDS = [
     "content",
     "summary",
     "summary_json",
+    "context",
     "token_count",
     "embedding",
     "created_at",
@@ -136,6 +137,8 @@ CHUNK_SUMMARY_PROMPT = """你是一位专业文本分析师，为一个长文章
 
 切片上下文：
 - 所属文章：<<TITLE>>
+- 整篇文章摘要（全局语境，仅用于理解背景；提取的实体/关系证据仍须来自本切片原文）：
+<<ARTICLE_CONTEXT>>
 - 切片序号：第 <<INDEX>> 个切片，共 <<TOTAL>> 个切片
 - 本切片文本：
 <<CONTENT>>
@@ -565,6 +568,7 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
             CHUNK_SUMMARY_PROMPT
             .replace("<<RELATIONS>>", "、".join(ALLOWED_RELATIONS))
             .replace("<<TITLE>>", title)
+            .replace("<<ARTICLE_CONTEXT>>", article_summary)
             .replace("<<INDEX>>", str(index))
             .replace("<<TOTAL>>", str(len(chunks)))
             .replace("<<CONTENT>>", chunk)
@@ -609,6 +613,7 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
                 "content": chunk,
                 "summary": chunk_summaries[index],
                 "summary_json": chunk_json_by_index[index],
+                "context": article_summary,
                 "token_count": len(chunk),
                 "embedding": "",
                 "created_at": now,
