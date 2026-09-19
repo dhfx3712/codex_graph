@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import os
@@ -12,6 +13,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+
+import shutil
 
 import requests
 
@@ -55,8 +58,11 @@ CHUNK_FIELDS = [
 ]
 
 ENV_FILE = Path("/home/ubuntu/codex_graphrag/.ollmam_env")
-VOLC_BASE_URL = os.getenv("VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
-MODEL_NAME = os.getenv("MODEL_NAME", "doubao-seed-2.0-lite")
+
+# 默认 LLM 端点（火山方舟）。下方变量改为在 call_llm 调用时按需读取，
+# 以兼容多种 OpenAI 兼容供应商的命名差异（火山/ARK、AMD、OpenAI 等）。
+DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
+DEFAULT_MODEL_NAME = "doubao-seed-2.0-lite"
 
 CHUNK_TARGET = 700
 CHUNK_MAX = 1000
@@ -98,15 +104,16 @@ ARTICLE_SUMMARY_PROMPT = """你是一位专业分析师，同时为知识图谱�
 实体要求：
 - 提取 8-15 个重要实体。
 - 每个实体字段：name（原始名称）、type（国家/机构/政策工具/事件/概念/资产/人物/制度等）、aliases（可能有多个别名，至少 1 个）、evidence（原文短语或短句）。
-- evidence 必须是原文中最短且足以证明该实体的片段，最多 50 个字；不要整段复制，不要扩写。
+- evidence 必须是 <<CONTENT>> 的逐字子串，不得改写、概括或扩写，也不得添加“本文/探究/搜索知识库”等元叙述；凡原文没有的句子一律不得写入 evidence。
 - 同名实体只出现一次，不同写法放进 aliases。
 
 关系要求：
 - 提取 8-15 条实体关系。
 - 每个关系字段：source、target、relation、evidence。
-- evidence 必须是原文中最短且足以证明该关系的片段，最多 50 个字；不要整句复制，不要解释关系内容。
-- source 和 target 必须出现在 entities 的 name 或 aliases 中。
+- evidence 必须是 <<CONTENT>> 的逐字子串，不得改写、概括或扩写，也不得添加“本文/探究/搜索知识库”等元叙述；凡原文没有的句子一律不得写入 evidence。
+- source 和 target 必须出现在 entities 的 name 或 aliases 中，禁止新造未在 entities 中列出的端点。
 - relation 只能从以下集合选择：<<RELATIONS>>。
+- 易混概念（如“一战/二战”“大萧条”等）必须严格按原文表述，不得混淆或自行补充原文没有的背景（反幻觉）。
 - 优先选择最贴切的关系，不要把所有因果关系都归类为“导致”。
 
 输出要求：
@@ -155,7 +162,9 @@ CHUNK_SUMMARY_PROMPT = """你是一位专业文本分析师，为一个长文章
 - 提取 3-8 个本切片关键实体，字段为 name、type、aliases、evidence。
 - 提取 2-6 条本切片关键关系，字段为 source、target、relation、evidence。
 - evidence 必须是原文中最短且足以证明该实体或关系的片段，最多 50 个字；不要整段复制，不要扩写。
-- source 和 target 必须出现在 entities 的 name 或 aliases 中。
+- evidence 必须是 <<CONTENT>> 的逐字子串，不得改写、概括或扩写，也不得添加“本切片讨论/搜索知识库/探究”等元叙述；凡原文没有的句子一律不得写入 evidence。
+- source 和 target 必须精确等于某个 entities 的 name 或 alias（归一化后一致），不得新造未在该 entities 中列出的实体名；若找不到对应实体就不要写这条关系。
+- 涉及历史时期/事件（尤其一战、二战、大萧条等易混概念）必须与原文表述严格一致，不得用你的背景知识补全、替换或推断关系方向；原文没提的连接一律不写。
 - relation 只能从以下集合选择：<<RELATIONS>>。
 - 优先选择最贴切的关系，不要把所有因果关系都归类为“导致”。
 
@@ -201,13 +210,21 @@ def ensure_directories() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def pending_markdown_files() -> list[Path]:
+def pending_markdown_files(force: bool = False) -> list[Path]:
     ensure_directories()
-    return sorted(
-        path
-        for path in UNDO_DIR.iterdir()
-        if path.is_file() and path.suffix.lower() == ".md"
-    )
+    # force 模式遍历 articles/{undo,do} 全部 md，按 stem 去重（undo 优先），用于重抽全部文章
+    search_dirs = (UNDO_DIR, DO_DIR) if force else (UNDO_DIR,)
+    seen_stems: set[str] = set()
+    result: list[Path] = []
+    for directory in search_dirs:
+        for path in sorted(directory.iterdir()):
+            if not (path.is_file() and path.suffix.lower() == ".md"):
+                continue
+            if path.stem in seen_stems:
+                continue
+            seen_stems.add(path.stem)
+            result.append(path)
+    return result
 
 
 def load_existing_ids(csv_path: Path) -> set[str]:
@@ -274,6 +291,31 @@ def move_to_done(md_path: Path) -> Path:
 
     md_path.rename(candidate)
     return candidate
+
+
+def upsert_rows(csv_path: Path, fieldnames: list[str], rows: list[dict]) -> int:
+    """按 id 覆盖写：已存在的 id 行被替换，新 id 行追加。用于 --force 重抽覆盖旧结果。
+
+    不依赖外部 seen_ids，直接基于文件中已有 id 做合并，避免清空整个 results 文件。
+    """
+    if not rows:
+        return 0
+    existing: list[dict] = []
+    if csv_path.exists() and csv_path.stat().st_size > 0:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as fp:
+            existing = list(csv.DictReader(fp))
+    by_id = {row["id"]: row for row in existing}
+    for row in rows:
+        by_id[row["id"]] = row
+    merged = list(by_id.values())
+    for row in merged:
+        for field in fieldnames:
+            row.setdefault(field, "")
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(merged)
+    return len(rows)
 
 
 def clean_markdown(text: str) -> str:
@@ -364,27 +406,60 @@ class LLMTruncatedError(RuntimeError):
     """Raised when the model response explicitly reports finish_reason=length."""
 
 
+def get_llm_config() -> dict:
+    """按优先级读取 LLM 配置，兼容多种供应商的命名差异。
+
+    每个字段独立查找首个非空值，优先级：
+      - AMD:         AMD_BASE_URL / AMD_API_KEY / AMD_MODEL_NAME
+      - 火山方舟:    VOLC_BASE_URL / ARK_API_KEY / VOLC_API_KEY / MODEL_NAME
+      - OpenAI 兼容: OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL / LLM_BASE_URL / LLM_API_KEY / LLM_MODEL
+    在调用时（已 load_env_file 之后）读取，确保 ENV_FILE 中的值能覆盖默认。
+    """
+    load_env_file()
+
+    def first(*names: str) -> str:
+        for name in names:
+            val = os.getenv(name, "")
+            if val:
+                return val
+        return ""
+
+    return {
+        "base_url": first("AMD_BASE_URL", "VOLC_BASE_URL", "OPENAI_BASE_URL", "LLM_BASE_URL")
+        or DEFAULT_BASE_URL,
+        "api_key": first("AMD_API_KEY", "ARK_API_KEY", "VOLC_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"),
+        "model": first("AMD_MODEL_NAME", "MODEL_NAME", "VOLC_MODEL_NAME", "OPENAI_MODEL", "LLM_MODEL")
+        or DEFAULT_MODEL_NAME,
+    }
+
+
 def call_llm(
     prompt: str,
     max_tokens: int,
     temperature: float,
     json_mode: bool = False,
 ) -> str:
-    load_env_file()
-    api_key = os.getenv("ARK_API_KEY", "")
+    cfg = get_llm_config()
+    api_key = cfg["api_key"]
     if not api_key:
         raise RuntimeError(
-            "ARK_API_KEY is not set and /home/ubuntu/codex_english/.env was not found"
+            f"未找到 LLM API Key：请设置 AMD_API_KEY / ARK_API_KEY / VOLC_API_KEY / OPENAI_API_KEY 之一"
+            f"（并检查 ENV_FILE={ENV_FILE} 是否含对应配置）"
         )
-    url = f"{VOLC_BASE_URL.rstrip('/')}/chat/completions"
+    url = f"{cfg['base_url'].rstrip('/')}/chat/completions"
     payload = {
-        "model": MODEL_NAME,
+        "model": cfg["model"],
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
+
+    # 可选：透传 REASONING_EFFORT（如 AMD 端点支持该参数），未设置则不影响其它供应商
+    reasoning_effort = os.getenv("REASONING_EFFORT", "").strip()
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
 
     response = requests.post(
         url,
@@ -395,7 +470,48 @@ def call_llm(
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         timeout=120,
     )
-    response.raise_for_status()
+
+    # 超时/重试配置（调用时读取，支持 ENV_FILE 覆盖）：
+    #   LLM_TIMEOUT      单次请求读超时（秒），默认 180（Qwen3 带推理时生成较慢）
+    #   LLM_MAX_RETRIES  网络/5xx 重试次数，默认 4
+    #   LLM_BACKOFF_BASE 退避基数（秒），第 n 次等待 backoff_base * 2**n
+    timeout = int(os.getenv("LLM_TIMEOUT", "180"))
+    max_retries = int(os.getenv("LLM_MAX_RETRIES", "4"))
+    backoff_base = float(os.getenv("LLM_BACKOFF_BASE", "2.0"))
+
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                timeout=timeout,
+            )
+            # 2xx 直接返回；4xx/5xx 抛 HTTPError，进入下方重试判断
+            response.raise_for_status()
+            last_exc = None
+            break
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            # 4xx（非 429）属客户端错误，重试无意义，立即抛出
+            if status is not None and status not in (429,) and status < 500:
+                raise
+            if attempt >= max_retries:
+                break
+            wait = backoff_base * (2 ** attempt)
+            print(
+                f"LLM 请求失败（第 {attempt + 1} 次，{type(exc).__name__}），"
+                f"{wait:.1f}s 后重试（上限 {max_retries} 次）"
+            )
+            time.sleep(wait)
+    if last_exc is not None:
+        raise last_exc
+
     data = response.json()
     choice = data["choices"][0]
     content = (choice.get("message") or {}).get("content", "").strip()
@@ -551,7 +667,7 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
     article_data = call_llm_json(
         article_prompt,
         max_tokens=2500,
-        temperature=0.3,
+        temperature=0.0,
         fallback_prompt=build_prompt_with_reduced_entities(article_prompt),
     )
     article_raw = json.dumps(article_data, ensure_ascii=False)
@@ -578,7 +694,7 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
         chunk_data = call_llm_json(
             chunk_prompt,
             max_tokens=1200,
-            temperature=0.3,
+            temperature=0.0,
         )
         chunk_raw = json.dumps(chunk_data, ensure_ascii=False)
         chunk_summaries[index] = chunk_data.get("human_summary") or chunk_raw
@@ -623,25 +739,108 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
     return article_row, chunk_rows
 
 
+def promote_results(src_dir: Path) -> int:
+    """把暂存目录的抽取结果合并进正式 results/，先备份旧文件。
+
+    合并按 id 覆盖：staging 中存在的 id 覆盖 live 中的同名行；
+    live 中不在 staging 的行保留（便于只 re-extract 部分文章后再切换）。
+    用于「结果先写到独立目录、验证无误再切换」的发布流程。
+    """
+    src_dir = Path(src_dir)
+    pairs = [("articles.csv", ARTICLE_FIELDS), ("chunks.csv", CHUNK_FIELDS)]
+    for name, fields in pairs:
+        src = src_dir / name
+        if not src.exists() or src.stat().st_size == 0:
+            print(f"待切换结果缺失或不完整：{src}")
+            return 1
+        dst = RESULTS_DIR / name
+        if dst.exists() and dst.stat().st_size > 0:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            backup = RESULTS_DIR / f"{dst.stem}.csv.bak.{timestamp}"
+            shutil.copyfile(dst, backup)
+            print(f"已备份旧 {name}: {backup.name}")
+        src_rows: list[dict] = []
+        with src.open("r", encoding="utf-8-sig", newline="") as fp:
+            src_rows = list(csv.DictReader(fp))
+        count = upsert_rows(dst, fields, src_rows)
+        print(f"已切换 {name}: 合并 {count} 行 -> {dst}")
+    return 0
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="对 articles 目录下的 Markdown 抽取摘要与知识图谱切片"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="重抽 articles/undo 与 articles/do 下全部 .md，按 id 覆盖已有结果（提示词/模型升级后重抽）",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        metavar="N",
+        help="本批次最多处理 N 个待处理文章（小批量）；0 表示不限制。配合 undo/do 归档可分批续接",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        metavar="N",
+        help="并发线程数；0 表示沿用 SUMMARIZE_PIPELINE_WORKERS 或默认 4。降低以缓解接口访问压力",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default="",
+        metavar="PATH",
+        help="结果写入目录（articles.csv/chunks.csv），默认 results/。用独立目录试跑，验证后再 --promote 切换",
+    )
+    parser.add_argument(
+        "--promote",
+        default="",
+        metavar="SRC_DIR",
+        help="把 SRC_DIR 的抽取结果合并进正式 results/（先备份旧文件），随后退出；不跑抽取",
+    )
+    args = parser.parse_args()
     ensure_directories()
     load_env_file()
-    pending_files = pending_markdown_files()
+
+    # --promote：仅做结果切换，不跑抽取
+    if args.promote:
+        return promote_results(Path(args.promote))
+
+    # 结果写入目录：默认 results/，可用 --out-dir 隔离试跑
+    out_dir = Path(args.out_dir) if args.out_dir else RESULTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_articles = out_dir / "articles.csv"
+    out_chunks = out_dir / "chunks.csv"
+
+    pending_files = pending_markdown_files(force=args.force)
+    if args.limit and args.limit > 0:
+        pending_files = pending_files[: args.limit]
 
     if not pending_files:
-        print(f"{UNDO_DIR} 中没有待处理的 .md 文件")
+        dir_label = "articles/undo 与 articles/do" if args.force else str(UNDO_DIR)
+        print(f"{dir_label} 中没有待处理的 .md 文件")
         return 0
 
-    ensure_header(OUT_ARTICLES, ARTICLE_FIELDS)
-    ensure_header(OUT_CHUNKS, CHUNK_FIELDS)
-    seen_article_ids = load_existing_ids(OUT_ARTICLES)
-    seen_chunk_ids = load_existing_ids(OUT_CHUNKS)
+    ensure_header(out_articles, ARTICLE_FIELDS)
+    ensure_header(out_chunks, CHUNK_FIELDS)
+    seen_article_ids = load_existing_ids(out_articles)
+    seen_chunk_ids = load_existing_ids(out_chunks)
 
-    max_workers = max(
-        1,
-        int(os.getenv("SUMMARIZE_PIPELINE_WORKERS", str(DEFAULT_MAX_WORKERS))),
+    if args.workers and args.workers > 0:
+        max_workers = args.workers
+    else:
+        max_workers = max(
+            1,
+            int(os.getenv("SUMMARIZE_PIPELINE_WORKERS", str(DEFAULT_MAX_WORKERS))),
+        )
+    print(
+        f"使用 {max_workers} 个线程处理 {len(pending_files)} 个文件"
+        f"（out-dir={out_dir}）"
     )
-    print(f"使用 {max_workers} 个线程处理 {len(pending_files)} 个文件")
 
     failed_files: list[str] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -654,33 +853,45 @@ def main() -> int:
             md_path = future_to_path[future]
             try:
                 article_row, chunk_rows = future.result()
-                written_articles = append_unique_rows(
-                    OUT_ARTICLES,
-                    ARTICLE_FIELDS,
-                    [article_row],
-                    seen_article_ids,
-                )
-                written_chunks = append_unique_rows(
-                    OUT_CHUNKS,
-                    CHUNK_FIELDS,
-                    chunk_rows,
-                    seen_chunk_ids,
-                )
+                if args.force:
+                    # --force：按 id 覆盖写，真正替换旧抽取结果（非追加去重）
+                    upsert_rows(out_articles, ARTICLE_FIELDS, [article_row])
+                    upsert_rows(out_chunks, CHUNK_FIELDS, chunk_rows)
+                    written_articles = [article_row]
+                    written_chunks = chunk_rows
+                else:
+                    written_articles = append_unique_rows(
+                        out_articles,
+                        ARTICLE_FIELDS,
+                        [article_row],
+                        seen_article_ids,
+                    )
+                    written_chunks = append_unique_rows(
+                        out_chunks,
+                        CHUNK_FIELDS,
+                        chunk_rows,
+                        seen_chunk_ids,
+                    )
                 print(
                     f"\n处理完成: {md_path.name}, "
                     f"新增文章 {len(written_articles)} 行, "
                     f"新增切片 {len(written_chunks)} 行"
                 )
 
-                moved_path = move_to_done(md_path)
-                print(f"已归档: {moved_path.relative_to(BASE_DIR)}")
+                if not args.force:
+                    moved_path = move_to_done(md_path)
+                    print(f"已归档: {moved_path.relative_to(BASE_DIR)}")
             except Exception as exc:
                 failed_files.append(md_path.name)
                 print(f"处理失败: {md_path.name}: {exc}")
 
 
+    if not args.force:
+        remaining = len(pending_markdown_files(force=False))
+        print(f"\n本批次结束。undo 中剩余未处理文章: {remaining} 个（重跑本命令即可从断点续接）")
+
     if failed_files:
-        print("\n以下文件处理失败，保留在 undo:")
+        print("\n以下文件处理失败，保留在 undo，重跑本命令即可续接:")
         for name in failed_files:
             print(f"- {name}")
         return 1

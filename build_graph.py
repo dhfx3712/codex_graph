@@ -54,6 +54,26 @@ def normalize_key(value: Any) -> str:
     return str(value or "").strip().casefold()
 
 
+# 受控词表：把易混别名归并到规范名。仅对表内 key 生效，不影响其他实体归一化。
+# 作用：让"一战"/"wwi"等变体并入"第一次世界大战"的根，避免 LLM 把关系端点写成错别名时
+# 形成孤立节点或错连。id 含 # 后缀的生成规则（UnionFind/root_to_node_id）保持不变。
+CANONICAL_ALIASES: dict[str, str] = {
+    "一战": "第一次世界大战",
+    "第一次世界大战": "第一次世界大战",
+    "wwi": "第一次世界大战",
+    "二战": "第二次世界大战",
+    "第二次世界大战": "第二次世界大战",
+    "wwii": "第二次世界大战",
+    # 可继续按业务补充：如 "大萧条": "1929年大萧条" 等
+}
+
+
+def canonical_key(value: Any) -> str:
+    """在 normalize_key 基础上，对受控词表内的别名做规范化；表外原样归一。"""
+    key = normalize_key(value)
+    return normalize_key(CANONICAL_ALIASES.get(key, value))
+
+
 def simplify_type(raw_type: str) -> str:
     """把 1975 个细碎 type 归并到少数量大类，方便着色和筛选。"""
     text = str(raw_type or "").strip()
@@ -156,6 +176,8 @@ def read_chunks(input_path: Path, max_rows: int) -> list[dict[str, Any]]:
                         "target": relation.get("target"),
                         "relation": relation.get("relation") or "未知",
                         "evidence": relation.get("evidence") or "",
+                        # #2 逐字校验用：evidence 必须是本切片原文（content）的子串
+                        "content": row.get("content") or "",
                     }
                 )
     return records
@@ -168,11 +190,12 @@ def build_nodes_and_edges(records: list[dict[str, Any]], max_evidence: int):
     uf = UnionFind()
     entity_keys: list[list[str]] = []
     for record in entity_records:
-        name_key = normalize_key(record["name"])
+        # #4 用 canonical_key 代替 normalize_key，使受控词表内的别名（一战/二战…）并入规范 root
+        name_key = canonical_key(record["name"])
         alias_keys = [
-            normalize_key(alias)
+            canonical_key(alias)
             for alias in record["aliases"]
-            if normalize_key(alias)
+            if canonical_key(alias)
         ]
         keys = list(dict.fromkeys([name_key, *alias_keys]))
         entity_keys.append(keys)
@@ -255,7 +278,8 @@ def build_nodes_and_edges(records: list[dict[str, Any]], max_evidence: int):
 
     def resolve_node(value: Any, node_id: str | None = None) -> str:
         raw_text = str(value or "").strip()
-        key = normalize_key(raw_text)
+        # #4 端点同样走 canonical_key，与实体 root 的归一规则保持一致
+        key = canonical_key(raw_text)
         root = root_by_key.get(key)
         if root in root_to_node_id:
             return root_to_node_id[root]
@@ -300,7 +324,16 @@ def build_nodes_and_edges(records: list[dict[str, Any]], max_evidence: int):
         }
     )
 
+    dropped_relations = 0
     for record in relation_records:
+        # #1 端点必须命中已建实体（root_by_key）；否则丢弃该边，不调用 resolve_node 造孤儿节点。
+        # 前提：此兜底依赖 #3（summarize_pipeline 提示词强制 target∈entities）才安全——
+        # 若模型漏抽实体会导致正确边也被丢弃，故必须与提示词强化配套使用。
+        src_key = canonical_key(record.get("source"))
+        tgt_key = canonical_key(record.get("target"))
+        if src_key not in root_by_key or tgt_key not in root_by_key:
+            dropped_relations += 1
+            continue
         source = resolve_node(record.get("source"), "source")
         target = resolve_node(record.get("target"), "target")
         pair_key = (source, target)
@@ -320,6 +353,10 @@ def build_nodes_and_edges(records: list[dict[str, Any]], max_evidence: int):
         )
         relation_entry["count"] += 1
         evidence = str(record.get("evidence") or "").strip()
+        # #2 逐字校验：evidence 必须是对应切片原文（content）的子串，否则丢弃该证据、保留关系本身
+        content = str(record.get("content") or "")
+        if evidence and content and evidence not in content:
+            evidence = ""
         if evidence and evidence not in relation_entry["evidence"]:
             if len(relation_entry["evidence"]) < max_evidence:
                 relation_entry["evidence"].append(evidence)
@@ -368,7 +405,7 @@ def build_nodes_and_edges(records: list[dict[str, Any]], max_evidence: int):
             ratio = node["weighted_degree"] / max_weighted_degree
             node["size"] = round(6.0 + 30.0 * math.sqrt(ratio), 2)
 
-    return nodes, edges, graph.to_undirected()
+    return nodes, edges, graph.to_undirected(), {"dropped_relations": dropped_relations}
 
 
 def compute_community_layout(graph: nx.Graph, seed: int) -> dict[Any, tuple[float, float]]:
@@ -473,9 +510,11 @@ def main() -> int:
     records = read_chunks(input_path, args.max_rows)
     print(f"读取到 {len(records)} 条实体/关系记录")
 
-    nodes, edges, undirected = build_nodes_and_edges(records, args.max_evidence)
+    nodes, edges, undirected, stats = build_nodes_and_edges(records, args.max_evidence)
     print(f"节点数（去重后）：{len(nodes)}")
     print(f"关系对数（去重后）：{len(edges)}")
+    # 端点未命中实体的被丢弃关系数；持续偏大说明模型漏抽实体或提示词未强制 target∈entities
+    print(f"被丢弃的孤立端点关系数（端点未命中实体）：{stats.get('dropped_relations', 0)}")
     print("开始预计算布局（Louvain 分簇 + 簇内 spring layout）...")
 
     positions = compute_community_layout(undirected, args.seed)
