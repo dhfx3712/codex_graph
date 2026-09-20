@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -454,22 +455,22 @@ def call_llm(
         "max_tokens": max_tokens,
     }
     if json_mode:
-        payload["response_format"] = {"type": "json_object"}
+        # AMD DeepSeek 系列不支持 response_format=json_object，按 base_url 判断
+        is_amd = "amd.com.cn" in cfg["base_url"].lower()
+        if not is_amd:
+            payload["response_format"] = {"type": "json_object"}
+        else:
+            # AMD 模型：用 prompt 指令强制 JSON 输出
+            payload["messages"][0]["content"] = (
+                "你只能输出合法 JSON，不要 Markdown 代码块，不要额外解释。\n\n"
+                + prompt
+            )
 
     # 可选：透传 REASONING_EFFORT（如 AMD 端点支持该参数），未设置则不影响其它供应商
     reasoning_effort = os.getenv("REASONING_EFFORT", "").strip()
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
 
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        timeout=120,
-    )
 
     # 超时/重试配置（调用时读取，支持 ENV_FILE 覆盖）：
     #   LLM_TIMEOUT      单次请求读超时（秒），默认 180（Qwen3 带推理时生成较慢）
@@ -635,10 +636,16 @@ def call_llm_json(
 
 
 def build_prompt_with_reduced_entities(prompt: str) -> str:
-    """Return an article prompt that permits fewer entities/relationships."""
+    """Return a prompt that permits fewer entities/relationships (JSON 截断兜底).
+
+    同时覆盖文章级（8-15）与切片级（3-8 / 2-6）两套措辞，
+    因此文章调用与切片调用可复用同一个降级函数。
+    """
     return (
         prompt.replace("提取 8-15 个重要实体", "为了控制输出长度，提取 6-12 个重要实体")
         .replace("提取 8-15 条实体关系", "为了控制输出长度，提取 6-12 条实体关系")
+        .replace("提取 3-8 个本切片关键实体", "为了控制输出长度，提取 2-5 个本切片关键实体")
+        .replace("提取 2-6 条本切片关键关系", "为了控制输出长度，提取 2-4 条本切片关键关系")
     )
 
 
@@ -664,22 +671,35 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
         .replace("<<TITLE>>", title)
         .replace("<<CONTENT>>", article_text)
     )
-    article_data = call_llm_json(
-        article_prompt,
-        max_tokens=2500,
-        temperature=0.0,
-        fallback_prompt=build_prompt_with_reduced_entities(article_prompt),
-    )
-    article_raw = json.dumps(article_data, ensure_ascii=False)
-    article_summary = article_data.get("human_summary") or article_raw
-    article_json = json.dumps(article_data, ensure_ascii=False)
+    try:
+        article_data = call_llm_json(
+            article_prompt,
+            max_tokens=2500,
+            temperature=0.0,
+            fallback_prompt=build_prompt_with_reduced_entities(article_prompt),
+        )
+        article_raw = json.dumps(article_data, ensure_ascii=False)
+        article_summary = article_data.get("human_summary") or article_raw
+        article_json = json.dumps(article_data, ensure_ascii=False)
+    except Exception as exc:
+        print(f"文章摘要抽取失败，使用空上下文继续切片：{exc}")
+        article_summary = ""
+        article_json = "{}" 
 
     chunk_summaries: dict[int, str] = {}
     chunk_json_by_index: dict[int, str] = {}
-    for index, chunk in enumerate(chunks, start=1):
-        print(f"正在生成切片摘要 {index}/{len(chunks)}")
-        previous_snippet, next_snippet = adjacent_contexts(chunks, index)
+    failed_chunk_indices: list[int] = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from functools import partial
 
+    def _process_one_chunk(
+        index: int,
+        chunk: str,
+        chunks: list[str],
+        title: str,
+        article_summary: str,
+    ) -> tuple[int, dict]:
+        previous_snippet, next_snippet = adjacent_contexts(chunks, index)
         chunk_prompt = (
             CHUNK_SUMMARY_PROMPT
             .replace("<<RELATIONS>>", "、".join(ALLOWED_RELATIONS))
@@ -695,10 +715,38 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
             chunk_prompt,
             max_tokens=1200,
             temperature=0.0,
+            fallback_prompt=build_prompt_with_reduced_entities(chunk_prompt),
         )
-        chunk_raw = json.dumps(chunk_data, ensure_ascii=False)
-        chunk_summaries[index] = chunk_data.get("human_summary") or chunk_raw
-        chunk_json_by_index[index] = json.dumps(chunk_data, ensure_ascii=False)
+        return index, chunk_data
+
+    # 确定切片并发数：-w 参数传到 generate_article_rows，暂时取环境变量或默认 4
+    chunk_workers = int(os.getenv("CHUNK_WORKERS", "4"))
+    with ThreadPoolExecutor(max_workers=chunk_workers) as chunk_executor:
+        futures = {
+            chunk_executor.submit(
+                _process_one_chunk, index, chunk, chunks, title, article_summary
+            ): index
+            for index, chunk in enumerate(chunks, start=1)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                index, chunk_data = future.result()
+                chunk_raw = json.dumps(chunk_data, ensure_ascii=False)
+                chunk_summaries[index] = chunk_data.get("human_summary") or chunk_raw
+                chunk_json_by_index[index] = json.dumps(chunk_data, ensure_ascii=False)
+                print(f"切片 {index}/{len(chunks)} 完成")
+            except Exception as exc:
+                failed_chunk_indices.append(idx)
+                print(f"切片 {idx}/{len(chunks)} 抽取失败，跳过：{exc}")
+
+    is_partial = len(failed_chunk_indices) > 0
+    if is_partial:
+        failed_str = "、".join(str(i) for i in failed_chunk_indices)
+        print(
+            f"文章「{title}」部分完成：成功 {len(chunk_summaries)}/{len(chunks)} 个切片，"
+            f"跳过切片 {failed_str}（status=partial）"
+        )
 
     article_id = str(uuid.uuid5(uuid.NAMESPACE_URL, md_path.resolve().as_uri()))
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -714,20 +762,21 @@ def generate_article_rows(md_path: Path) -> tuple[dict, list[dict]]:
         "summary": article_summary,
         "summary_json": article_json,
         "word_count": word_count,
-        "status": "active",
+        "status": "partial" if is_partial else "active",
         "created_at": now,
         "updated_at": now,
     }
 
     chunk_rows = []
-    for index, chunk in enumerate(chunks, start=1):
+    for index, summary in chunk_summaries.items():
+        chunk = chunks[index - 1]
         chunk_rows.append(
             {
                 "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{article_id}:{index}")),
                 "article_id": article_id,
                 "chunk_index": index,
                 "content": chunk,
-                "summary": chunk_summaries[index],
+                "summary": summary,
                 "summary_json": chunk_json_by_index[index],
                 "context": article_summary,
                 "token_count": len(chunk),

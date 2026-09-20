@@ -304,3 +304,35 @@ codex --profile amd-qwen
 
   需要浏览器访问外网地址时，加 --public-host <公网IP或域名>（仅用于日志提示，拒绝 TLS 请求时才用到）。
 
+
+
+
+SUMMARIZE_PIPELINE_WORKERS=1 CHUNK_WORKERS=1 LLM_TIMEOUT=300 LLM_MAX_RETRIES=6 python summarize_pipeline.py --limit 50 --workers 1 --out-dir results_staging 2>&1
+
+
+
+# 1) 小批量试跑，写到独立目录（降低并发，避免打爆接口）
+SUMMARIZE_PIPELINE_WORKERS=2 LLM_TIMEOUT=300 LLM_MAX_RETRIES=5 \
+  python summarize_pipeline.py --limit 50 --workers 2 --out-dir results_staging
+
+# 2) 接口断开/跑完一批后，直接重跑同一条命令即可续接剩余文章
+#    （脚本会打印「undo 中剩余未处理文章: N 个」）
+
+# 3) 全量跑完后，先零成本审计暂存结果
+python quality_audit.py results_staging/chunks.csv
+
+# 4) 审计达标（ev合规>80%、端点>95%、最低分>0.75）再切换
+python summarize_pipeline.py --promote results_staging
+
+
+
+关键语义说明
+续接零状态依赖：续接完全靠 undo/do 文件位置判断，不需要额外记录文件；重跑即"从未处理文章开始"。
+--promote 是合并而非覆盖：staging 的同 id 覆盖线上旧行，线上独有行（不在 staging 的）保留——适合"只重抽了部分文章"的场景；切换前自动生成 articles.csv.bak.<时间戳> / chunks.csv.bak.<时间戳> 可回滚。
+失败即保留、不污染：冒烟已验证 b 篇模拟 LLM 断开时，整篇不写进 staging，重跑仍从 undo 捡起，staging 只含处理完成的文章。
+验证不碰线上：quality_audit.py 直接吃 results_staging/chunks.csv，跑完确认无误再 --promote。
+
+
+
+
+
