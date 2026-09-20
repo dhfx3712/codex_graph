@@ -131,6 +131,16 @@ def safe_json(value: str | None) -> dict[str, Any] | None:
         return None
 
 
+def make_evidence(text: str, chunk_id: str, article_id: str, chunk_index: Any) -> dict[str, Any]:
+    """把纯文本 evidence 包装为带溯源 id 的对象，便于前端回到原文出处。"""
+    return {
+        "text": text,
+        "chunk_id": chunk_id,
+        "article_id": article_id,
+        "chunk_index": chunk_index,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", default=DEFAULT_INPUT)
@@ -152,6 +162,10 @@ def read_chunks(input_path: Path, max_rows: int) -> list[dict[str, Any]]:
             if parsed is None:
                 continue
             chunk_id = str(row.get("id") or f"row-{line_no}")
+            # #5 携带切片溯源信息：evidence 需能回到原文（文章/段/切片 id）
+            article_id = str(row.get("article_id") or "")
+            chunk_index_raw = row.get("chunk_index")
+            chunk_index = int(chunk_index_raw) if str(chunk_index_raw).isdigit() else chunk_index_raw
             for entity in parsed.get("entities", []):
                 if not isinstance(entity, dict):
                     continue
@@ -159,6 +173,8 @@ def read_chunks(input_path: Path, max_rows: int) -> list[dict[str, Any]]:
                     {
                         "kind": "entity",
                         "chunk_id": chunk_id,
+                        "article_id": article_id,
+                        "chunk_index": chunk_index,
                         "name": entity.get("name"),
                         "type": entity.get("type") or "未知",
                         "aliases": entity.get("aliases") or [],
@@ -172,6 +188,8 @@ def read_chunks(input_path: Path, max_rows: int) -> list[dict[str, Any]]:
                     {
                         "kind": "relation",
                         "chunk_id": chunk_id,
+                        "article_id": article_id,
+                        "chunk_index": chunk_index,
                         "source": relation.get("source"),
                         "target": relation.get("target"),
                         "relation": relation.get("relation") or "未知",
@@ -209,7 +227,7 @@ def build_nodes_and_edges(records: list[dict[str, Any]], max_evidence: int):
     root_display_counter: dict[str, Counter[str]] = defaultdict(Counter)
     root_display_names: dict[str, set[str]] = defaultdict(set)
     root_type_counter: dict[str, Counter[str]] = defaultdict(Counter)
-    root_evidence: dict[str, list[str]] = defaultdict(list)
+    root_evidence: dict[str, list[dict[str, Any]]] = defaultdict(list)
     root_evidence_seen: dict[str, set[str]] = defaultdict(set)
     root_mentions: Counter[str] = Counter()
     root_chunk_ids: dict[str, set[str]] = defaultdict(set)
@@ -231,7 +249,10 @@ def build_nodes_and_edges(records: list[dict[str, Any]], max_evidence: int):
         if evidence and evidence not in root_evidence_seen[root]:
             root_evidence_seen[root].add(evidence)
             if len(root_evidence[root]) < max_evidence:
-                root_evidence[root].append(evidence)
+                # #5 evidence 带上切片溯源 id，方便前端回到原文出处
+                root_evidence[root].append(
+                    make_evidence(evidence, record["chunk_id"], record["article_id"], record["chunk_index"])
+                )
         root_mentions[root] += 1
         root_chunk_ids[root].add(record["chunk_id"])
 
@@ -357,9 +378,13 @@ def build_nodes_and_edges(records: list[dict[str, Any]], max_evidence: int):
         content = str(record.get("content") or "")
         if evidence and content and evidence not in content:
             evidence = ""
-        if evidence and evidence not in relation_entry["evidence"]:
+        # #5 去重按 text；命中后带上切片溯源 id（chunk_id/article_id/chunk_index）
+        existing_texts = {ev.get("text") for ev in relation_entry["evidence"]}
+        if evidence and evidence not in existing_texts:
             if len(relation_entry["evidence"]) < max_evidence:
-                relation_entry["evidence"].append(evidence)
+                relation_entry["evidence"].append(
+                    make_evidence(evidence, record["chunk_id"], record["article_id"], record["chunk_index"])
+                )
         pair["pair_weight"] += 1
 
     nodes = list(node_by_root.values())

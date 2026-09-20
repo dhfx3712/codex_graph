@@ -254,6 +254,13 @@
       line-height: 1.6;
       word-break: break-word;
     }
+    .evidence-src {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      word-break: break-all;
+    }
     .aliases {
       color: #a9bcd3;
       font-size: 13px;
@@ -395,6 +402,19 @@
           .replaceAll('>', '&gt;')
           .replaceAll('"', '&quot;')
           .replaceAll("'", '&#039;');
+      }
+
+      function renderEvidence(item) {
+        const text = typeof item === 'string' ? item : (item && item.text != null ? String(item.text) : '');
+        let src = '';
+        if (item && typeof item === 'object') {
+          const parts = [];
+          if (item.chunk_id) parts.push('chunk:' + item.chunk_id);
+          if (item.article_id) parts.push('文章:' + item.article_id);
+          if (item.chunk_index != null && item.chunk_index !== '') parts.push('第' + item.chunk_index + '段');
+          if (parts.length) src = `<span class="evidence-src">来源 · ${escapeHtml(parts.join(' · '))}</span>`;
+        }
+        return `<div class="evidence">${escapeHtml(text)}${src}</div>`;
       }
 
       function nodeScreen(node) {
@@ -668,8 +688,8 @@
             </div>
             ${aliases.length ? `<div class="section"><h3>别名</h3><div class="aliases">${aliases.map(escapeHtml).join('、')}</div></div>` : ''}
             <div class="section">
-              <h3>Evidence</h3>
-              ${(node.evidence || []).length ? node.evidence.map(item => `<div class="evidence">${escapeHtml(item)}</div>`).join('') : '<div class="evidence">无 evidence</div>'}
+              <h3>Evidence（含原文溯源 id）</h3>
+              ${(node.evidence || []).length ? node.evidence.map(renderEvidence).join('') : '<div class="evidence">无 evidence</div>'}
             </div>
             <div class="actions">
               <button data-id="${escapeHtml(node.id)}" data-action="expand">展开邻居</button>
@@ -703,7 +723,7 @@
                     <span>${escapeHtml(rel.relation)}</span>
                     <span class="relation-count">${rel.count} 次</span>
                   </div>
-                  ${(rel.evidence || []).length ? rel.evidence.map(item => `<div class="evidence">${escapeHtml(item)}</div>`).join('') : '<div class="evidence">无 evidence</div>'}
+                  ${(rel.evidence || []).length ? rel.evidence.map(renderEvidence).join('') : '<div class="evidence">无 evidence</div>'}
                 </div>
               `).join('')}
             </div>

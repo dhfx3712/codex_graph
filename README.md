@@ -334,5 +334,16 @@ python summarize_pipeline.py --promote results_staging
 
 
 
+定位evidence位置
+awk -v id="7c5d9121-2024-5d72-a670-3d3dd6dc4785" '
+BEGIN { found=0 }
+/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12},/ {
+    if (found) exit          # 遇到下一条记录，结束
+    if ($0 ~ "^" id ",") found=1
+}
+found { print }
+' chunks.csv
+
+
 
 
